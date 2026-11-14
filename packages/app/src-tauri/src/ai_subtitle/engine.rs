@@ -763,6 +763,7 @@ impl RealtimeCueAssembler {
                 .lock()
                 .ok()
                 .and_then(|mut tracker| tracker.take_start());
+            let used_lookback = local_start_pts_ms.is_none() && self.next_start_pts_ms.is_none();
             let start_pts_ms = self
                 .next_start_pts_ms
                 .take()
@@ -770,6 +771,15 @@ impl RealtimeCueAssembler {
                 .unwrap_or_else(|| {
                     latest_audio_pts_ms.saturating_sub(UNANCHORED_REALTIME_CUE_LOOKBACK_MS)
                 });
+            if used_lookback {
+                log::info!(
+                    "[AiSubtitle][LookbackDiag] runtime latest_audio_pts_ms={} lookback_ms={} cue_start_pts_ms={} applied_offset_ms={}",
+                    latest_audio_pts_ms,
+                    UNANCHORED_REALTIME_CUE_LOOKBACK_MS,
+                    start_pts_ms,
+                    latest_audio_pts_ms.saturating_sub(start_pts_ms),
+                );
+            }
             self.cue = Some(AiSubtitleCue {
                 id: Uuid::new_v4().to_string(),
                 source_text: String::new(),

@@ -32,7 +32,7 @@ impl Default for AiSubtitleConfig {
             source_language: "auto".to_string(),
             target_language: "zh".to_string(),
             audio_source: AiSubtitleAudioSource::AutoScout,
-            lead_seconds: 9,
+            lead_seconds: 5,
             sync_offset_ms: 0,
             font_size: 32,
             show_original: true,
@@ -141,7 +141,7 @@ mod tests {
         let config: AiSubtitleConfig = serde_json::from_str("{}").unwrap();
 
         assert_eq!(config.model, "qwen-plus");
-        assert_eq!(config.lead_seconds, 9);
+        assert_eq!(config.lead_seconds, 5);
         assert_eq!(config.target_language, "zh");
     }
 

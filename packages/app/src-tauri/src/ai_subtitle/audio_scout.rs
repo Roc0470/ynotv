@@ -82,12 +82,12 @@ pub fn start_standalone(
         .arg("1")
         .arg("-reconnect_delay_max")
         .arg("5")
-        // Segment URLs on this provider have no file extension
-        // (`.../manifest/<hash>/0/36114812`), which FFmpeg's HLS demuxer rejects
-        // by default with "not in allowed_segment_extensions". mpv's bundled
-        // FFmpeg allows it, which is why playback works but the scout does not.
-        .arg("-extension_picky")
-        .arg("0");
+        // This provider's HLS segment URLs have no file extension. Permit those
+        // playlists and segments explicitly.
+        .arg("-allowed_extensions")
+        .arg("ALL")
+        .arg("-allowed_segment_extensions")
+        .arg("ALL");
 
     let mut user_agent = None;
     let mut header_lines = Vec::new();

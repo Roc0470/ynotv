@@ -49,6 +49,39 @@
   animation: ai-subtitle-sync-toast-lifecycle 1.5s ease forwards;
 }
 
+.ai-subtitle-sync-controls {
+  position: absolute;
+  top: 14%;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  transform: translateX(-50%);
+  padding: 5px 8px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  border-radius: 6px;
+  background: rgba(8, 12, 18, 0.78);
+  color: #fff;
+  font-size: 12px;
+  pointer-events: auto;
+  backdrop-filter: blur(8px);
+}
+
+.ai-subtitle-sync-controls button {
+  min-width: 58px;
+  min-height: 32px;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.ai-subtitle-sync-controls button:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
 @keyframes ai-subtitle-sync-toast-lifecycle {
   0%,
   74% {

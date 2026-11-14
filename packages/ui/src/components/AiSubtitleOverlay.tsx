@@ -65,6 +65,9 @@ export function AiSubtitleOverlay({ visible = true }: AiSubtitleOverlayProps) {
   const [position, setPosition] = useState(readPosition);
   const [lastCueAt, setLastCueAt] = useState(0);
   const [syncToast, setSyncToast] = useState<SyncToast | null>(null);
+  const [syncOffsetMs, setSyncOffsetMs] = useState(0);
+  const [showSyncControls, setShowSyncControls] = useState(false);
+  const syncControlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dragStartRef = useRef<DragStart | null>(null);
   const positionRef = useRef(position);
   positionRef.current = position;
@@ -119,15 +122,16 @@ export function AiSubtitleOverlay({ visible = true }: AiSubtitleOverlayProps) {
     void subscribe('ai-subtitle://cue', acceptCue);
     void subscribe('ai-subtitle:state', acceptStatus);
     void subscribe('ai-subtitle://status', acceptStatus);
+    void subscribe('ai-subtitle:sync-offset', (payload) => {
+      if (typeof payload === 'number' && Number.isFinite(payload)) setSyncOffsetMs(payload);
+    });
 
-    void invoke<{
-      showOriginal?: boolean;
-      fontSize?: number;
-    }>('ai_subtitle_get_config')
+    void invoke<AiSubtitleConfig>('ai_subtitle_get_config')
       .then((config) => {
         if (disposed) return;
         if (typeof config.showOriginal === 'boolean') setShowOriginal(config.showOriginal);
         if (typeof config.fontSize === 'number') setFontSize(config.fontSize);
+        if (typeof config.syncOffsetMs === 'number') setSyncOffsetMs(config.syncOffsetMs);
       })
       .catch((error) => {
         console.warn('[AiSubtitleOverlay] Could not load subtitle appearance config:', error);
@@ -135,9 +139,41 @@ export function AiSubtitleOverlay({ visible = true }: AiSubtitleOverlayProps) {
 
     return () => {
       disposed = true;
+      hideSyncControls();
       unlisten.forEach((stopListening) => stopListening());
     };
   }, [acceptCue, acceptStatus]);
+
+  const hideSyncControls = useCallback(() => {
+    if (syncControlsTimerRef.current) {
+      clearTimeout(syncControlsTimerRef.current);
+      syncControlsTimerRef.current = null;
+    }
+    setShowSyncControls(false);
+  }, []);
+
+  const showSyncControlsTemporarily = useCallback(() => {
+    hideSyncControls();
+    setShowSyncControls(true);
+    syncControlsTimerRef.current = setTimeout(() => {
+      setShowSyncControls(false);
+      syncControlsTimerRef.current = null;
+    }, 1_500);
+  }, [hideSyncControls]);
+
+  const adjustSync = useCallback((deltaMs: number) => {
+    void invoke<AiSubtitleConfig>('ai_subtitle_adjust_sync', { deltaMs })
+      .then((config) => {
+        setSyncOffsetMs(config.syncOffsetMs);
+        setSyncToast({ offsetMs: config.syncOffsetMs, shownAt: Date.now() });
+        showSyncControlsTemporarily();
+      })
+      .catch((error) => {
+        console.error('[AiSubtitleOverlay] Could not adjust subtitle sync offset:', error);
+        setSyncToast({ offsetMs: Number.NaN, shownAt: Date.now() });
+        showSyncControlsTemporarily();
+      });
+  }, [showSyncControlsTemporarily]);
 
   useEffect(() => {
     if (!cue || !lastCueAt || status.status === 'buffering') return;
@@ -161,21 +197,28 @@ export function AiSubtitleOverlay({ visible = true }: AiSubtitleOverlayProps) {
       )) return;
 
       const deltaMs = event.key === '[' ? -500 : event.key === ']' ? 500 : 0;
-      if (deltaMs === 0) return;
-      event.preventDefault();
-      void invoke<AiSubtitleConfig>('ai_subtitle_adjust_sync', { deltaMs })
-        .then((config) => setSyncToast({
-          offsetMs: config.syncOffsetMs,
-          shownAt: Date.now(),
-        }))
-        .catch((error) => {
-          console.error('[AiSubtitleOverlay] Could not adjust subtitle sync offset:', error);
-        });
+      if (deltaMs !== 0) {
+        event.preventDefault();
+        adjustSync(deltaMs);
+        return;
+      }
+      if (event.key === '\\') {
+        event.preventDefault();
+        void invoke<AiSubtitleConfig>('ai_subtitle_sync_now', {})
+          .then((config) => {
+            setSyncOffsetMs(config.syncOffsetMs);
+            setSyncToast({ offsetMs: config.syncOffsetMs, shownAt: Date.now() });
+            showSyncControlsTemporarily();
+          })
+          .catch((error) => {
+            console.error('[AiSubtitleOverlay] Could not sync subtitle to live voice:', error);
+          });
+      }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [enabled, visible]);
+  }, [adjustSync, enabled, visible]);
 
   const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -233,7 +276,16 @@ export function AiSubtitleOverlay({ visible = true }: AiSubtitleOverlayProps) {
       )}
       {enabled && syncToast && (
         <div key={syncToast.shownAt} className="ai-subtitle-sync-toast visible" role="status">
-          字幕时序：{formatSyncOffset(syncToast.offsetMs)}
+          {Number.isFinite(syncToast.offsetMs)
+            ? `字幕补偿：${formatSyncOffset(syncToast.offsetMs)}`
+            : '字幕补偿设置失败，请检查日志'}
+        </div>
+      )}
+      {showSyncControls && (
+        <div className="ai-subtitle-sync-controls" aria-label="AI 字幕延迟补偿">
+          <button type="button" title="字幕提前 0.5 秒" aria-label="字幕提前 0.5 秒" onClick={() => adjustSync(-500)}>−0.5s</button>
+          <span>{formatSyncOffset(syncOffsetMs)}</span>
+          <button type="button" title="字幕延后 0.5 秒" aria-label="字幕延后 0.5 秒" onClick={() => adjustSync(500)}>+0.5s</button>
         </div>
       )}
       <div
