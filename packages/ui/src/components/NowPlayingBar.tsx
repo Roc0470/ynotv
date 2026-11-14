@@ -25,6 +25,7 @@ import { TeamChannelOverlay } from './sports/TeamChannelOverlay';
 import { FailoverChannelOverlay } from './FailoverChannelOverlay';
 import { AiSubtitleSettingsModal } from './AiSubtitleSettingsModal';
 import { normalizeAiSubtitleStatus, type AiSubtitleStatusPayload } from './aiSubtitleTypes';
+import { resolvePlayUrl } from '../services/stream-resolver';
 import './NowPlayingBar.css';
 
 interface NowPlayingBarProps {
@@ -238,7 +239,13 @@ export function NowPlayingBar({
   }, []);
 
   const getAiSubtitleHeaders = useCallback(async () => {
-    let source: { type?: string; user_agent?: string } | undefined;
+    let source: {
+      type?: string;
+      user_agent?: string;
+      referer?: string;
+      origin?: string;
+      authorization?: string;
+    } | undefined;
     if (window.storage && aiSubtitleChannel?.source_id) {
       try {
         const result = await window.storage.getSource(aiSubtitleChannel.source_id);
@@ -254,20 +261,25 @@ export function NowPlayingBar({
       || (source?.type === 'stalker'
         ? 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3'
         : 'VLC/3.0.18 LibVLC/3.0.18');
-    return { 'User-Agent': userAgent };
+    const headers: Record<string, string> = { 'User-Agent': userAgent };
+    if (source?.referer?.trim()) headers.Referer = source.referer.trim();
+    if (source?.origin?.trim()) headers.Origin = source.origin.trim();
+    if (source?.authorization?.trim()) headers.Authorization = source.authorization.trim();
+    return headers;
   }, [aiSubtitleChannel?.source_id]);
 
   const toggleAiSubtitleSession = useCallback(async () => {
     if (!aiSubtitleChannel?.direct_url) throw new Error('当前没有可用的直播流地址');
+    const resolved = await resolvePlayUrl(aiSubtitleChannel.source_id, aiSubtitleChannel.direct_url);
     const headers = await getAiSubtitleHeaders();
     const enabled = await invoke<boolean>('ai_subtitle_toggle', {
-      streamUrl: aiSubtitleChannel.direct_url,
+      streamUrl: resolved.url,
       headers,
     });
     setAiSubtitleStatus(enabled
       ? { status: 'preparing', secondsLeft: 9, leadSeconds: 9 }
       : { status: 'disabled' });
-  }, [aiSubtitleChannel?.direct_url, getAiSubtitleHeaders]);
+  }, [aiSubtitleChannel?.direct_url, aiSubtitleChannel?.source_id, getAiSubtitleHeaders]);
 
   const handleToggleAiSubtitle = useCallback(async () => {
     try {
