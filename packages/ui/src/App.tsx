@@ -27,6 +27,7 @@ import { useModal } from './components/Modal';
 import { NowPlayingBar } from './components/NowPlayingBar';
 import { PiPMediaBar } from './components/PiPMediaBar';
 import { ChannelInfoOverlay } from './components/ChannelInfoOverlay';
+import { AiSubtitleOverlay } from './components/AiSubtitleOverlay';
 import { ConnectionInfoOverlay } from './components/ConnectionInfoOverlay';
 import { DEFAULT_SHORTCUTS, formatShortcutKey } from './constants/shortcuts';
 import { TrackSelectionModal } from './components/TrackSelectionModal';
@@ -6864,6 +6865,7 @@ function useTmdbPresencePoster(
           multiviewLayout !== 'bigbottom'
         }
         channel={guideHighlightChannel}
+        playbackChannel={currentChannel}
         playing={playing}
         muted={muted}
         volume={volume}
@@ -6966,6 +6968,7 @@ function useTmdbPresencePoster(
       )}
 
       {/* Channel Info Overlay */}
+      <AiSubtitleOverlay visible={!pipMode && activeView === 'none'} />
       <ChannelInfoOverlay
         channel={currentChannel}
         visible={isChannelInfoOverlayVisible}

@@ -12,19 +12,27 @@ use std::sync::{
 };
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, Runtime};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 
 #[derive(Serialize, Clone, Debug)]
 pub struct AudioSpectrumData {
-    pub bins: Vec<f32>,      // 64 logarithmic frequency bins [0.0..1.0]
-    pub wave: Vec<f32>,      // 64 time-domain waveform samples [-1.0..1.0]
-    pub stereo_l: Vec<f32>,  // 64 left channel samples [-1.0..1.0]
-    pub stereo_r: Vec<f32>,  // 64 right channel samples [-1.0..1.0]
+    pub bins: Vec<f32>,     // 64 logarithmic frequency bins [0.0..1.0]
+    pub wave: Vec<f32>,     // 64 time-domain waveform samples [-1.0..1.0]
+    pub stereo_l: Vec<f32>, // 64 left channel samples [-1.0..1.0]
+    pub stereo_r: Vec<f32>, // 64 right channel samples [-1.0..1.0]
+}
+
+#[derive(Clone, Debug)]
+pub struct PcmAudioPacket {
+    pub sample_rate_hz: u32,
+    pub mono_samples: Vec<f32>,
 }
 
 pub struct AudioCaptureState {
     pub is_running: Arc<AtomicBool>,
     pub target_pid: Arc<AtomicU32>,
     pub capture_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pcm_subscribers: Arc<Mutex<Vec<Sender<PcmAudioPacket>>>>,
 }
 
 impl AudioCaptureState {
@@ -33,7 +41,19 @@ impl AudioCaptureState {
             is_running: Arc::new(AtomicBool::new(false)),
             target_pid: Arc::new(AtomicU32::new(0)),
             capture_thread: Mutex::new(None),
+            pcm_subscribers: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    pub fn subscribe_pcm(&self) -> Receiver<PcmAudioPacket> {
+        let (sender, receiver) = mpsc::channel(16);
+        match self.pcm_subscribers.lock() {
+            Ok(mut subscribers) => subscribers.push(sender),
+            Err(error) => {
+                log::error!("[AudioCapture] PCM subscriber lock failed: {}", error);
+            }
+        }
+        receiver
     }
 
     pub fn start<R: Runtime>(&self, app: AppHandle<R>, pid: u32) {
@@ -46,10 +66,11 @@ impl AudioCaptureState {
         self.target_pid.store(pid, Ordering::SeqCst);
 
         let is_running = Arc::clone(&self.is_running);
+        let pcm_subscribers = Arc::clone(&self.pcm_subscribers);
         let target_pid = pid;
 
         let handle = std::thread::spawn(move || {
-            run_capture_loop(app, is_running, target_pid);
+            run_capture_loop(app, is_running, target_pid, pcm_subscribers);
         });
 
         *self.capture_thread.lock().unwrap() = Some(handle);
@@ -67,12 +88,20 @@ impl AudioCaptureState {
 }
 
 #[cfg(target_os = "windows")]
-fn run_capture_loop<R: Runtime>(app: AppHandle<R>, is_running: Arc<AtomicBool>, pid: u32) {
+fn run_capture_loop<R: Runtime>(
+    app: AppHandle<R>,
+    is_running: Arc<AtomicBool>,
+    pid: u32,
+    pcm_subscribers: Arc<Mutex<Vec<Sender<PcmAudioPacket>>>>,
+) {
     use rustfft::{num_complex::Complex, FftPlanner};
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
 
-    log::info!("[AudioCapture] Initializing Windows capture thread (PID={})", pid);
+    log::info!(
+        "[AudioCapture] Initializing Windows capture thread (PID={})",
+        pid
+    );
 
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -82,10 +111,16 @@ fn run_capture_loop<R: Runtime>(app: AppHandle<R>, is_running: Arc<AtomicBool>, 
     let mut audio_client: Option<IAudioClient> = None;
 
     if pid > 0 {
-        log::info!("[AudioCapture] Attempting per-process WASAPI loopback for PID={}", pid);
+        log::info!(
+            "[AudioCapture] Attempting per-process WASAPI loopback for PID={}",
+            pid
+        );
         audio_client = activate_process_loopback(pid).ok();
         if audio_client.is_some() {
-            log::info!("[AudioCapture] Per-process loopback activated successfully for PID={}", pid);
+            log::info!(
+                "[AudioCapture] Per-process loopback activated successfully for PID={}",
+                pid
+            );
         } else {
             log::warn!("[AudioCapture] Per-process WASAPI activation failed; falling back to default render device loopback");
         }
@@ -150,7 +185,10 @@ fn run_capture_loop<R: Runtime>(app: AppHandle<R>, is_running: Arc<AtomicBool>, 
     let capture_client: IAudioCaptureClient = match unsafe { client.GetService() } {
         Ok(cc) => cc,
         Err(e) => {
-            log::error!("[AudioCapture] GetService<IAudioCaptureClient> failed: {:?}", e);
+            log::error!(
+                "[AudioCapture] GetService<IAudioCaptureClient> failed: {:?}",
+                e
+            );
             unsafe { CoUninitialize() };
             return;
         }
@@ -188,6 +226,7 @@ fn run_capture_loop<R: Runtime>(app: AppHandle<R>, is_running: Arc<AtomicBool>, 
         };
 
         let mut current_packet = packet_size;
+        let packet_start = pcm_mono_buffer.len();
         while current_packet > 0 && is_running.load(Ordering::Relaxed) {
             let mut p_data: *mut u8 = std::ptr::null_mut();
             let mut num_frames: u32 = 0;
@@ -258,6 +297,23 @@ fn run_capture_loop<R: Runtime>(app: AppHandle<R>, is_running: Arc<AtomicBool>, 
             current_packet = unsafe { capture_client.GetNextPacketSize() }.unwrap_or(0);
         }
 
+        if pcm_mono_buffer.len() > packet_start {
+            let packet = PcmAudioPacket {
+                sample_rate_hz: sample_rate as u32,
+                mono_samples: pcm_mono_buffer[packet_start..].to_vec(),
+            };
+            if let Ok(mut subscribers) = pcm_subscribers.lock() {
+                subscribers.retain(|subscriber| match subscriber.try_send(packet.clone()) {
+                    Ok(()) => true,
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        log::warn!("[AudioCapture] Removing PCM subscriber that could not keep up");
+                        false
+                    }
+                });
+            }
+        }
+
         // Keep rolling buffer sizes bounded
         if pcm_mono_buffer.len() > FFT_SIZE * 4 {
             let drain_len = pcm_mono_buffer.len() - FFT_SIZE;
@@ -280,7 +336,10 @@ fn run_capture_loop<R: Runtime>(app: AppHandle<R>, is_running: Arc<AtomicBool>, 
                 .iter()
                 .enumerate()
                 .map(|(i, &s)| {
-                    let window = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE - 1) as f32).cos());
+                    let window = 0.5
+                        * (1.0
+                            - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE - 1) as f32)
+                                .cos());
                     Complex::new(s * window, 0.0)
                 })
                 .collect();
@@ -297,8 +356,10 @@ fn run_capture_loop<R: Runtime>(app: AppHandle<R>, is_running: Arc<AtomicBool>, 
                 let f_end = 30.0 * (14000.0 / 30.0f32).powf((i + 1) as f32 / NUM_BINS as f32);
 
                 // Exclude k=0 (DC offset) entirely; k_start >= 1
-                let k_start = ((f_start / bin_resolution).floor() as usize).clamp(1, (FFT_SIZE / 2) - 1);
-                let k_end = ((f_end / bin_resolution).ceil() as usize).clamp(k_start + 1, FFT_SIZE / 2);
+                let k_start =
+                    ((f_start / bin_resolution).floor() as usize).clamp(1, (FFT_SIZE / 2) - 1);
+                let k_end =
+                    ((f_end / bin_resolution).ceil() as usize).clamp(k_start + 1, FFT_SIZE / 2);
 
                 let mut max_mag = 0.0f32;
                 for k in k_start..k_end {
@@ -353,7 +414,12 @@ fn run_capture_loop<R: Runtime>(app: AppHandle<R>, is_running: Arc<AtomicBool>, 
 }
 
 #[cfg(not(target_os = "windows"))]
-fn run_capture_loop<R: Runtime>(_app: AppHandle<R>, _is_running: Arc<AtomicBool>, _pid: u32) {
+fn run_capture_loop<R: Runtime>(
+    _app: AppHandle<R>,
+    _is_running: Arc<AtomicBool>,
+    _pid: u32,
+    _pcm_subscribers: Arc<Mutex<Vec<Sender<PcmAudioPacket>>>>,
+) {
     log::info!("[AudioCapture] Audio capture is non-Windows stub");
 }
 
@@ -379,7 +445,9 @@ struct CompletionHandlerVtbl {
 struct CompletionHandlerObj {
     pub vtbl: *const CompletionHandlerVtbl,
     pub ref_count: std::sync::atomic::AtomicU32,
-    pub sender: Mutex<Option<std::sync::mpsc::Sender<Result<windows::Win32::Media::Audio::IAudioClient, String>>>>,
+    pub sender: Mutex<
+        Option<std::sync::mpsc::Sender<Result<windows::Win32::Media::Audio::IAudioClient, String>>>,
+    >,
 }
 
 #[cfg(target_os = "windows")]
@@ -403,7 +471,9 @@ unsafe extern "system" fn completion_query_interface(
     }
     unsafe {
         let iid = *riid;
-        if iid == windows::core::IUnknown::IID || iid == IActivateAudioInterfaceCompletionHandler::IID {
+        if iid == windows::core::IUnknown::IID
+            || iid == IActivateAudioInterfaceCompletionHandler::IID
+        {
             *ppvObject = this;
             completion_add_ref(this);
             return windows::core::HRESULT(0); // S_OK
@@ -452,9 +522,7 @@ unsafe extern "system" fn completion_activate_completed(
         return windows::core::HRESULT(0);
     }
 
-    let op: IActivateAudioInterfaceAsyncOperation = unsafe {
-        std::mem::transmute(activate_op_ptr)
-    };
+    let op: IActivateAudioInterfaceAsyncOperation = unsafe { std::mem::transmute(activate_op_ptr) };
 
     let mut hr = windows::core::HRESULT(0);
     let mut unk: Option<windows::core::IUnknown> = None;
@@ -476,7 +544,10 @@ unsafe extern "system" fn completion_activate_completed(
     }
 
     if let Some(s) = sender {
-        let _ = s.send(Err(format!("GetActivateResult failed with HRESULT: 0x{:08X}", hr.0)));
+        let _ = s.send(Err(format!(
+            "GetActivateResult failed with HRESULT: 0x{:08X}",
+            hr.0
+        )));
     }
     std::mem::forget(op);
     windows::core::HRESULT(0)
@@ -484,7 +555,9 @@ unsafe extern "system" fn completion_activate_completed(
 
 /// Helper: Activate WASAPI Process-Specific Loopback using ActivateAudioInterfaceAsync
 #[cfg(target_os = "windows")]
-fn activate_process_loopback(pid: u32) -> Result<windows::Win32::Media::Audio::IAudioClient, String> {
+fn activate_process_loopback(
+    pid: u32,
+) -> Result<windows::Win32::Media::Audio::IAudioClient, String> {
     use windows::core::{Interface, PCWSTR, PROPVARIANT};
     use windows::Win32::Media::Audio::*;
 
@@ -532,7 +605,9 @@ fn activate_process_loopback(pid: u32) -> Result<windows::Win32::Media::Audio::I
     });
     let handler_ptr = Box::into_raw(handler_obj) as *mut std::ffi::c_void;
 
-    let device_path: Vec<u16> = "{13902FD4-701A-42A8-9477-0C7F7BC8645D}\0".encode_utf16().collect();
+    let device_path: Vec<u16> = "{13902FD4-701A-42A8-9477-0C7F7BC8645D}\0"
+        .encode_utf16()
+        .collect();
     let prop_ptr = &raw_prop as *const _ as *const PROPVARIANT;
 
     unsafe {

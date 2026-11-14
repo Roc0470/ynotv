@@ -2,6 +2,7 @@ import { type ChangeEvent, useEffect, useState, useRef, useCallback, useMemo } f
 import { useTranslation } from 'react-i18next';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import type { StoredChannel } from '../db';
 import type { VodPlayInfo } from '../types/media';
 import { useCurrentProgram, parseCategoryIds } from '../hooks/useChannels';
@@ -22,11 +23,14 @@ import { hasJellyfinQueue, resolveJellyfinQueuePosition, jellyfinQueueItemLabel 
 import { getLocalEpisodeList } from '../services/local-library/local-library';
 import { TeamChannelOverlay } from './sports/TeamChannelOverlay';
 import { FailoverChannelOverlay } from './FailoverChannelOverlay';
+import { AiSubtitleSettingsModal } from './AiSubtitleSettingsModal';
+import { normalizeAiSubtitleStatus, type AiSubtitleStatusPayload } from './aiSubtitleTypes';
 import './NowPlayingBar.css';
 
 interface NowPlayingBarProps {
   visible: boolean;
   channel: StoredChannel | null;
+  playbackChannel?: StoredChannel | null;
   playing: boolean;
   muted: boolean;
   volume: number;
@@ -115,6 +119,7 @@ function formatTime(seconds: number): string {
 export function NowPlayingBar({
   visible,
   channel,
+  playbackChannel,
   playing,
   muted,
   volume,
@@ -199,9 +204,90 @@ export function NowPlayingBar({
   const [recordUntilStop, setRecordUntilStop] = useState(false);
   const [recordTitle, setRecordTitle] = useState('');
   const [isStopAndRecord, setIsStopAndRecord] = useState(false);
+  const [aiSubtitleStatus, setAiSubtitleStatus] = useState<AiSubtitleStatusPayload>({ status: 'disabled' });
+  const [aiSubtitleSettingsOpen, setAiSubtitleSettingsOpen] = useState(false);
   const canControl = mpvReady && channel !== null;
   const currentProgram = useCurrentProgram(channel?.stream_id ?? null);
   const { showSuccess, showError, showConfirmThree, showPrompt, ModalComponent } = useModal();
+  const aiSubtitleActive = ['preparing', 'listening', 'running', 'buffering', 'paused']
+    .includes(aiSubtitleStatus.status);
+  const aiSubtitleChannel = playbackChannel ?? channel;
+  const canStartAiSubtitle = canControl && !isVod && !isCatchup && Boolean(aiSubtitleChannel?.direct_url);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisten: Array<() => void> = [];
+    const subscribe = async (eventName: string) => {
+      try {
+        const stopListening = await listen<unknown>(eventName, (event) => {
+          const nextStatus = normalizeAiSubtitleStatus(event.payload);
+          if (nextStatus) setAiSubtitleStatus(nextStatus);
+        });
+        if (disposed) stopListening();
+        else unlisten.push(stopListening);
+      } catch (error) {
+        console.warn(`[NowPlayingBar] Could not listen for ${eventName}:`, error);
+      }
+    };
+    void subscribe('ai-subtitle:state');
+    void subscribe('ai-subtitle://status');
+    return () => {
+      disposed = true;
+      unlisten.forEach((stopListening) => stopListening());
+    };
+  }, []);
+
+  const getAiSubtitleHeaders = useCallback(async () => {
+    let source: { type?: string; user_agent?: string } | undefined;
+    if (window.storage && aiSubtitleChannel?.source_id) {
+      try {
+        const result = await window.storage.getSource(aiSubtitleChannel.source_id);
+        source = result?.data;
+      } catch (error) {
+        console.warn('[NowPlayingBar] Could not read source headers for AI subtitle:', error);
+      }
+    }
+
+    const configuredAgent = useSettingsStore.getState().globalLiveTvUserAgent?.trim();
+    const userAgent = source?.user_agent?.trim()
+      || configuredAgent
+      || (source?.type === 'stalker'
+        ? 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3'
+        : 'VLC/3.0.18 LibVLC/3.0.18');
+    return { 'User-Agent': userAgent };
+  }, [aiSubtitleChannel?.source_id]);
+
+  const toggleAiSubtitleSession = useCallback(async () => {
+    if (!aiSubtitleChannel?.direct_url) throw new Error('当前没有可用的直播流地址');
+    const headers = await getAiSubtitleHeaders();
+    const enabled = await invoke<boolean>('ai_subtitle_toggle', {
+      streamUrl: aiSubtitleChannel.direct_url,
+      headers,
+    });
+    setAiSubtitleStatus(enabled
+      ? { status: 'preparing', secondsLeft: 9, leadSeconds: 9 }
+      : { status: 'disabled' });
+  }, [aiSubtitleChannel?.direct_url, getAiSubtitleHeaders]);
+
+  const handleToggleAiSubtitle = useCallback(async () => {
+    try {
+      await toggleAiSubtitleSession();
+    } catch (error) {
+      console.error('[NowPlayingBar] Failed to toggle AI subtitles:', error);
+      setAiSubtitleStatus({ status: 'error', message: String(error) });
+      showError('AI 同传', String(error));
+    }
+  }, [toggleAiSubtitleSession, showError]);
+
+  const handleApplyAiSubtitleEnabled = useCallback(async (enabled: boolean) => {
+    if (enabled === aiSubtitleActive) return;
+    try {
+      await toggleAiSubtitleSession();
+    } catch (error) {
+      setAiSubtitleStatus({ status: 'error', message: String(error) });
+      throw error;
+    }
+  }, [aiSubtitleActive, toggleAiSubtitleSession]);
 
   // Active playlist context: only reported when the currently playing video is
   // actually the playlist's current item (a stale session can't show here).
@@ -1154,6 +1240,31 @@ export function NowPlayingBar({
                   <SubtitleIcon />
                 </button>
 
+                <div className="ai-subtitle-player-controls">
+                  <button
+                    type="button"
+                    className={`npb-clean-btn ai-subtitle-player-toggle ${aiSubtitleActive ? 'active' : ''} status-${aiSubtitleStatus.status}`}
+                    onClick={handleToggleAiSubtitle}
+                    disabled={!canStartAiSubtitle && !aiSubtitleActive}
+                    title={aiSubtitleStatus.status === 'error'
+                      ? aiSubtitleStatus.message || 'AI 同传发生错误'
+                      : '切换 AI 同传'}
+                  >
+                    <span className="ai-subtitle-player-star">✦</span>
+                    <span>AI 同传</span>
+                    <span className="ai-subtitle-player-indicator" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="npb-clean-btn ai-subtitle-player-settings"
+                    onClick={() => setAiSubtitleSettingsOpen(true)}
+                    title="AI 同传设置"
+                    aria-label="AI 同传设置"
+                  >
+                    <SettingsIcon />
+                  </button>
+                </div>
+
                 {showHdrQuickToggle && (
                   <button
                     className={`npb-clean-btn npb-hdr-btn ${hdrTonemapToSdr ? 'active' : ''}`}
@@ -1563,6 +1674,30 @@ export function NowPlayingBar({
                 >
                   <SubtitleIcon />
                 </button>
+                <div className="ai-subtitle-player-controls">
+                  <button
+                    type="button"
+                    className={`npb-btn ai-subtitle-player-toggle ${aiSubtitleActive ? 'active' : ''} status-${aiSubtitleStatus.status}`}
+                    onClick={handleToggleAiSubtitle}
+                    disabled={!canStartAiSubtitle && !aiSubtitleActive}
+                    title={aiSubtitleStatus.status === 'error'
+                      ? aiSubtitleStatus.message || 'AI 同传发生错误'
+                      : '切换 AI 同传'}
+                  >
+                    <span className="ai-subtitle-player-star">✦</span>
+                    <span>AI 同传</span>
+                    <span className="ai-subtitle-player-indicator" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="npb-btn ai-subtitle-player-settings"
+                    onClick={() => setAiSubtitleSettingsOpen(true)}
+                    title="AI 同传设置"
+                    aria-label="AI 同传设置"
+                  >
+                    <SettingsIcon />
+                  </button>
+                </div>
                 {showHdrQuickToggle && (
                   <button
                     className={`npb-btn npb-hdr-btn ${hdrTonemapToSdr ? 'active' : ''}`}
@@ -1924,6 +2059,12 @@ export function NowPlayingBar({
       )}
 
       {/* Themed Modal */}
+      <AiSubtitleSettingsModal
+        isOpen={aiSubtitleSettingsOpen}
+        active={aiSubtitleActive}
+        onClose={() => setAiSubtitleSettingsOpen(false)}
+        onApplyEnabled={handleApplyAiSubtitleEnabled}
+      />
       <ModalComponent />
     </div>
   );
@@ -2009,6 +2150,15 @@ function SubtitleIcon() {
       <line x1="6" y1="10" x2="12" y2="10" />
       <line x1="14" y1="10" x2="18" y2="10" />
       <line x1="6" y1="14" x2="15" y2="14" />
+    </svg>
+  );
+}
+
+function SettingsIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="3" />
+      <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06-1.6 2.77-.08-.02a1.7 1.7 0 0 0-1.75.62l-.05.07h-3.2l-.03-.08a1.7 1.7 0 0 0-1.48-1.13l-.08-.01-1.6-2.77.06-.06A1.7 1.7 0 0 0 10.1 15l-.09-.03v-3.2l.08-.03a1.7 1.7 0 0 0 1.13-1.48l.01-.08 2.77-1.6.06.06a1.7 1.7 0 0 0 1.88.34l.08-.03 2.77 1.6-.02.08a1.7 1.7 0 0 0 .62 1.75l.07.05v3.2l-.08.03a1.7 1.7 0 0 0-1.13 1.48l-.01.08" />
     </svg>
   );
 }

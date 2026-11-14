@@ -1,0 +1,157 @@
+.ai-subtitle-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  pointer-events: none;
+}
+
+.ai-subtitle-status {
+  position: absolute;
+  top: 8%;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(90vw, 680px);
+  padding: 9px 16px;
+  border: 1px solid rgba(103, 232, 249, 0.3);
+  border-radius: 999px;
+  background: rgba(5, 18, 26, 0.72);
+  color: #d7fbff;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: center;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.28);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+
+.ai-subtitle-sync-toast {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  padding: 10px 18px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  background: rgba(8, 12, 18, 0.76);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 650;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  transform: translate(-50%, -50%);
+  opacity: 0;
+  visibility: hidden;
+}
+
+.ai-subtitle-sync-toast.visible {
+  animation: ai-subtitle-sync-toast-lifecycle 1.5s ease forwards;
+}
+
+@keyframes ai-subtitle-sync-toast-lifecycle {
+  0%,
+  74% {
+    opacity: 1;
+    visibility: visible;
+  }
+
+  100% {
+    opacity: 0;
+    visibility: hidden;
+  }
+}
+
+.ai-subtitle-cue {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  width: min(92vw, 1400px);
+  padding: 5px 12px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.18);
+  color: #fff;
+  text-align: center;
+  transform: translate(-50%, -50%);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 350ms ease, visibility 350ms ease;
+  text-shadow:
+    -1px -1px 2px #000,
+    1px -1px 2px #000,
+    -1px 1px 2px #000,
+    1px 1px 2px #000,
+    0 2px 6px rgba(0, 0, 0, 0.95);
+  user-select: none;
+  touch-action: none;
+}
+
+.ai-subtitle-cue.visible {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+  cursor: grab;
+}
+
+.ai-subtitle-cue:active {
+  cursor: grabbing;
+}
+
+.ai-subtitle-original {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 1;
+  width: 100%;
+  max-width: 100%;
+  max-height: calc(1.15em * 1);
+  overflow: hidden;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  color: rgba(225, 250, 255, 0.94);
+  font-size: clamp(12px, calc(var(--ai-subtitle-font-size) * 0.5), 18px);
+  font-weight: 500;
+  line-height: 1.15;
+}
+
+.ai-subtitle-translation {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  width: 100%;
+  max-width: 100%;
+  max-height: calc(1.15em * 2);
+  overflow: hidden;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  font-size: clamp(18px, min(var(--ai-subtitle-font-size), 2vw), 38px);
+  font-weight: 750;
+  line-height: 1.15;
+}
+
+.ai-subtitle-cue.partial .ai-subtitle-translation {
+  opacity: 0.82;
+}
+
+.ai-subtitle-dots {
+  color: rgba(165, 243, 252, 0.85);
+  font-size: 11px;
+  letter-spacing: 3px;
+  animation: ai-subtitle-breathe 1.15s ease-in-out infinite;
+}
+
+@keyframes ai-subtitle-breathe {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ai-subtitle-cue,
+  .ai-subtitle-dots {
+    transition: none;
+    animation: none;
+  }
+}

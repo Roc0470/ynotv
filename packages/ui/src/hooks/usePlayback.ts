@@ -765,6 +765,7 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
   // Monotonic sequence for handlePlayChannel: guards against the async
   // failover-primary lookup resolving out of order during rapid channel zaps.
   const playChannelSeqRef = useRef(0);
+  const aiSubtitleStreamChangeSeqRef = useRef(0);
   const streamFailureHandlingRef = useRef(false);
   const recoveryArmedRef = useRef(false);
   const userPausedRef = useRef(false);
@@ -1012,6 +1013,7 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
     channel: StoredChannel,
     options: { recoveryMode?: boolean } = {}
   ): Promise<boolean> => {
+    const aiSubtitleStreamChangeSeq = ++aiSubtitleStreamChangeSeqRef.current;
     // Clear error immediately - stale errors from old channel will be ignored
     setError(null);
 
@@ -1096,6 +1098,23 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
         setCurrentChannel(resolvedChannel);
         setPlaying(true);
         resetHealthTracking();
+        let aiSubtitleRestarted = false;
+        if (
+          aiSubtitleStreamChangeSeq === aiSubtitleStreamChangeSeqRef.current
+          && !Bridge.getIsCasting?.()
+        ) {
+          const userAgent = resolved.userAgent?.trim()
+            || useSettingsStore.getState().globalLiveTvUserAgent?.trim()
+            || 'VLC/3.0.18 LibVLC/3.0.18';
+          try {
+            aiSubtitleRestarted = await invoke<boolean>('ai_subtitle_stream_changed', {
+              streamUrl: result.url,
+              headers: { 'User-Agent': userAgent },
+            });
+          } catch (error) {
+            logWarn('[Playback] Could not restart AI subtitles after channel switch:', error);
+          }
+        }
         // Arm recovery as soon as the live load succeeds so both event-based
         // reconnect AND stall detection can react to a later death. Previously
         // this was only armed by the stall-detection watchdog after observing
@@ -1108,7 +1127,7 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
         // Skip when casting: cast_load_media auto-starts playback on the Chromecast,
         // and calling cast_play here races against the concurrent castCurrentMedia()
         // call (triggered by the cast-status listener), causing INVALID_MEDIA_SESSION_ID.
-        if (!Bridge.getIsCasting?.()) {
+        if (!Bridge.getIsCasting?.() && !aiSubtitleRestarted) {
           Bridge.play().catch(e => console.warn('[usePlayback] play() after load failed:', e));
         }
         
