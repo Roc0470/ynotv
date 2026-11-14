@@ -1200,6 +1200,13 @@ fn select_cue(inner: &mut ControllerInner) -> Option<Option<AiSubtitleCue>> {
         if inner.last_emitted_cue.as_ref() == Some(cue) {
             return None;
         }
+        if inner
+            .last_emitted_cue
+            .as_ref()
+            .is_some_and(|last| cue.start_pts_ms < last.start_pts_ms)
+        {
+            return None;
+        }
         let cue_start_pts_ms = cue.start_pts_ms;
         let jumped = inner
             .last_emitted_cue
