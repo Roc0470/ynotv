@@ -40,7 +40,7 @@ const REALTIME_CUE_MAX_TRANSLATED_CHARS: usize = 38;
 const REALTIME_CUE_MAX_SOURCE_CHARS: usize = 130;
 /// A sentence terminator only ends a cue once the translation has at least this
 /// many characters, so short interjections do not become their own caption.
-const REALTIME_MIN_SENTENCE_CHARS: usize = 8;
+const REALTIME_MIN_SENTENCE_CHARS: usize = 4;
 /// A long sentence may also break at a clause comma once it reaches this size,
 /// which keeps the break on a natural boundary instead of mid-word.
 const REALTIME_CLAUSE_BREAK_CHARS: usize = 18;
