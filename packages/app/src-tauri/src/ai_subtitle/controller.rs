@@ -421,7 +421,13 @@ async fn run_session(
     audio_source: AiSubtitleAudioSource,
     cancellation: CancellationToken,
 ) {
-    let decoded_audio_ms = Arc::new(AtomicU64::new(main_clock(&inner, generation).unwrap_or(0)));
+    let initial_main_played_ms = main_clock(&inner, generation).unwrap_or(0);
+    let decoded_audio_ms = Arc::new(AtomicU64::new(initial_main_played_ms));
+    log::warn!(
+        "[AiSubtitleDiag] standalone decoded_audio init main_played={} decoded_initial={}",
+        initial_main_played_ms,
+        decoded_audio_ms.load(Ordering::SeqCst),
+    );
     if audio_source == AiSubtitleAudioSource::DirectTap {
         start_direct_fallback(
             app,
@@ -1227,6 +1233,12 @@ fn emit_cue_update(app: &AppHandle, cue_update: Option<Option<AiSubtitleCue>>) {
 /// player position maps to `scout_pts + elapsed`.
 fn sync_cue_base(inner: &mut ControllerInner, scout_pts_ms: u64) {
     let new_base_pts_ms = scout_pts_ms.saturating_sub(inner.main_played_pts_ms);
+    log::warn!(
+        "[AiSubtitleDiag] sync_cue_base scout_pts={} main_played={} new_base={}",
+        scout_pts_ms,
+        inner.main_played_pts_ms,
+        new_base_pts_ms,
+    );
     if inner.pace_cue_windows && new_base_pts_ms > inner.cue_base_pts_ms {
         // Cues accepted before playback resumed were paced on a render clock
         // that had not started yet; shift their slots onto the real timeline.
