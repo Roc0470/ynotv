@@ -1201,14 +1201,24 @@ fn select_cue(inner: &mut ControllerInner) -> Option<Option<AiSubtitleCue>> {
             return None;
         }
         let cue_start_pts_ms = cue.start_pts_ms;
+        let jumped = inner
+            .last_emitted_cue
+            .as_ref()
+            .is_some_and(|last| cue_start_pts_ms < last.start_pts_ms);
+        let latest_audio_pts_ms = inner
+            .main_played_pts_ms
+            .saturating_add(inner.cue_base_pts_ms);
+        let backlog_ms = latest_audio_pts_ms.saturating_sub(cue_start_pts_ms);
         inner.last_emitted_cue = Some(cue.clone());
         log::warn!(
-            "[AiSubtitleDiag] show id={} audio_pts={} display_pts={} base={} delta={}",
+            "[AiSubtitleDiag] show id={} audio_pts={} display_pts={} base={} delta={} backlog_ms={} jumped={}",
             cue.id.chars().take(8).collect::<String>(),
             cue_start_pts_ms,
             render_pts_ms,
             inner.cue_base_pts_ms,
             render_pts_ms - (i128::from(cue_start_pts_ms) + i128::from(inner.cue_base_pts_ms)),
+            backlog_ms,
+            jumped,
         );
         Some(Some(cue.clone()))
     } else if inner.last_emitted_cue.take().is_some() {
