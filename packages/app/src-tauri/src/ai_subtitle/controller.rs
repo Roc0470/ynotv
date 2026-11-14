@@ -558,10 +558,10 @@ async fn run_session(
                     }
                     if let Ok(mut state) = inner.lock() {
                         if state.generation == generation {
-                            sync_cue_base(
-                                &mut state,
-                                decoded_audio_ms.load(Ordering::SeqCst),
-                            );
+                            let scout_pts = decoded_audio_ms
+                                .load(Ordering::SeqCst)
+                                .min(state.main_played_pts_ms + lead_ms);
+                            sync_cue_base(&mut state, scout_pts);
                         }
                     }
                     if let Err(error) = resume_main_player(&app).await {
