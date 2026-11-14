@@ -81,13 +81,18 @@ pub fn start_standalone(
         .arg("-reconnect_streamed")
         .arg("1")
         .arg("-reconnect_delay_max")
-        .arg("5")
+        .arg("5");
+
+    let hls_url = stream_url.split_once('?').map_or(stream_url.as_str(), |(url, _)| url);
+    if hls_url.trim_end_matches('/').ends_with(".m3u8") {
         // This provider's HLS segment URLs have no file extension. Permit those
         // playlists and segments explicitly.
-        .arg("-allowed_extensions")
-        .arg("ALL")
-        .arg("-allowed_segment_extensions")
-        .arg("ALL");
+        command
+            .arg("-allowed_extensions")
+            .arg("ALL")
+            .arg("-allowed_segment_extensions")
+            .arg("ALL");
+    }
 
     let mut user_agent = None;
     let mut header_lines = Vec::new();
