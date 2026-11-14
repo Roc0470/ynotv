@@ -1171,6 +1171,7 @@ fn select_cue(inner: &mut ControllerInner) -> Option<Option<AiSubtitleCue>> {
             .saturating_add(inner.cue_base_pts_ms),
     );
     let sync_offset_ms = i128::from(inner.sync_offset_ms);
+    let cue_base_pts_ms = i128::from(inner.cue_base_pts_ms);
     let paced = inner.pace_cue_windows;
     // Show partial (streaming) translations as soon as they arrive so the
     // viewer does not have to wait for the whole sentence to be translated.
@@ -1182,16 +1183,16 @@ fn select_cue(inner: &mut ControllerInner) -> Option<Option<AiSubtitleCue>> {
             .rev()
             .find(|cue| {
                 showable(cue)
-                && i128::from(cue.start_pts_ms) + sync_offset_ms <= render_pts_ms
-                && i128::from(cue.end_pts_ms) + sync_offset_ms >= render_pts_ms
+                && i128::from(cue.start_pts_ms) + cue_base_pts_ms + sync_offset_ms <= render_pts_ms
+                && i128::from(cue.end_pts_ms) + cue_base_pts_ms + sync_offset_ms >= render_pts_ms
             })
         .or_else(|| {
             inner.cues.iter().rev().find(|cue| {
                 showable(cue)
-                    && i128::from(cue.start_pts_ms) + sync_offset_ms <= render_pts_ms
-                    && render_pts_ms > i128::from(cue.end_pts_ms) + sync_offset_ms
+                    && i128::from(cue.start_pts_ms) + cue_base_pts_ms + sync_offset_ms <= render_pts_ms
+                    && render_pts_ms > i128::from(cue.end_pts_ms) + cue_base_pts_ms + sync_offset_ms
                     && render_pts_ms
-                        - (i128::from(cue.end_pts_ms) + sync_offset_ms)
+                        - (i128::from(cue.end_pts_ms) + cue_base_pts_ms + sync_offset_ms)
                         <= LATE_CUE_GRACE_MS
             })
         });
@@ -1222,7 +1223,7 @@ fn select_cue(inner: &mut ControllerInner) -> Option<Option<AiSubtitleCue>> {
             cue_start_pts_ms,
             render_pts_ms,
             inner.cue_base_pts_ms,
-            render_pts_ms - i128::from(cue_start_pts_ms),
+            render_pts_ms - (i128::from(cue_start_pts_ms) + i128::from(inner.cue_base_pts_ms)),
             backlog_ms,
             jumped,
         );
