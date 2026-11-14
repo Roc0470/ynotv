@@ -421,7 +421,7 @@ async fn run_session(
     audio_source: AiSubtitleAudioSource,
     cancellation: CancellationToken,
 ) {
-    let decoded_audio_ms = Arc::new(AtomicU64::new(0));
+    let decoded_audio_ms = Arc::new(AtomicU64::new(main_clock(&inner, generation).unwrap_or(0)));
     if audio_source == AiSubtitleAudioSource::DirectTap {
         start_direct_fallback(
             app,
