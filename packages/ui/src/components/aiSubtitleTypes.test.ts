@@ -6,8 +6,11 @@ import {
 } from './aiSubtitleTypes';
 
 describe('AI subtitle defaults', () => {
-  it('uses the longer nine-second lead-in', () => {
-    expect(DEFAULT_AI_SUBTITLE_CONFIG.leadSeconds).toBe(9);
+  it('uses DashScope realtime with five-second lead-in by default', () => {
+    expect(DEFAULT_AI_SUBTITLE_CONFIG.provider).toBe('dash_scope');
+    expect(DEFAULT_AI_SUBTITLE_CONFIG.route).toBe('realtime');
+    expect(DEFAULT_AI_SUBTITLE_CONFIG.model).toBe('qwen3.8-livetranslate-flash-realtime');
+    expect(DEFAULT_AI_SUBTITLE_CONFIG.leadSeconds).toBe(5);
   });
 });
 

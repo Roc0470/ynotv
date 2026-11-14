@@ -1,9 +1,5 @@
 export type AiSubtitleProvider =
   | 'dash_scope'
-  | 'gemini'
-  | 'zhipu'
-  | 'deep_seek'
-  | 'tvgo'
   | 'open_ai_compatible';
 
 export type AiSubtitleRoute = 'two_stage' | 'realtime' | 'multimodal';
@@ -52,14 +48,14 @@ export interface AiSubtitleStatusPayload {
 export const DEFAULT_AI_SUBTITLE_CONFIG: AiSubtitleConfig = {
   enabled: false,
   provider: 'dash_scope',
-  route: 'two_stage',
+  route: 'realtime',
   apiKey: null,
   baseUrl: null,
-  model: 'qwen-plus',
+  model: 'qwen3.8-livetranslate-flash-realtime',
   sourceLanguage: 'auto',
   targetLanguage: 'zh',
   audioSource: 'auto_scout',
-  leadSeconds: 9,
+  leadSeconds: 5,
   syncOffsetMs: 0,
   fontSize: 32,
   showOriginal: true,

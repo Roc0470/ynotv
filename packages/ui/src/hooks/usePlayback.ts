@@ -25,6 +25,7 @@ import {
   restorableSubtitleTrackId,
 } from '../utils/subtitleIntent';
 import i18n, { translateNativeError } from '../i18n';
+import { normalizeAiSubtitleStatus } from '../components/aiSubtitleTypes';
 
 /**
  * Push Nuvio watch progress for the given item, building the entry from the
@@ -719,6 +720,9 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
     }
   }, [currentChannel, playing, position, pausedForCache, error, loadingState, vodInfo, catchupInfo, loadInFlight]);
 
+  // AI 字幕蓄水准备期间后台会主动暂停主播放器，加载超时、看门狗与断流重连均需在此期间豁免。
+  const aiSubtitlePreparingRef = useRef(false);
+
   // Effect to check timeout (12s) when loading or buffering
   useEffect(() => {
     if (loadingState === 'idle') return;
@@ -727,6 +731,10 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
     loadingStartedAtRef.current = Date.now();
 
     const interval = setInterval(() => {
+      if (aiSubtitlePreparingRef.current) {
+        loadingStartedAtRef.current = Date.now();
+        return;
+      }
       if (loadingStartedAtRef.current && Date.now() - loadingStartedAtRef.current > 12000) {
         if (loadingState === 'loading' || loadingState === 'buffering') {
           setLoadingState('unavailable');
@@ -825,6 +833,38 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
     healthCheckInFlightRef.current = false;
     healthLoadGraceUntilRef.current = now + graceMs;
   }, []);
+
+  // 监听 AI 字幕状态事件：蓄水阶段（preparing）豁免健康检查，结束蓄水时重置计时器。
+  useEffect(() => {
+    if (!Bridge.isTauri) return;
+    let disposed = false;
+    const unlisten: Array<() => void> = [];
+
+    const handleAiSubtitleEvent = (payload: unknown) => {
+      const normalized = normalizeAiSubtitleStatus(payload);
+      if (!normalized) return;
+      if (normalized.status === 'preparing') {
+        aiSubtitlePreparingRef.current = true;
+      } else if (aiSubtitlePreparingRef.current) {
+        aiSubtitlePreparingRef.current = false;
+        resetHealthTracking();
+      }
+    };
+
+    for (const eventName of ['ai-subtitle:state', 'ai-subtitle://status']) {
+      listen<unknown>(eventName, (event) => handleAiSubtitleEvent(event.payload))
+        .then((fn) => {
+          if (disposed) fn();
+          else unlisten.push(fn);
+        })
+        .catch(() => {});
+    }
+
+    return () => {
+      disposed = true;
+      unlisten.forEach((fn) => fn());
+    };
+  }, [resetHealthTracking]);
 
   // Handle pending catchup seek when duration becomes available
   useEffect(() => {
@@ -1111,6 +1151,10 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
               streamUrl: result.url,
               headers: { 'User-Agent': userAgent },
             });
+            if (aiSubtitleRestarted) {
+              aiSubtitlePreparingRef.current = true;
+              resetHealthTracking();
+            }
           } catch (error) {
             logWarn('[Playback] Could not restart AI subtitles after channel switch:', error);
           }
@@ -1387,6 +1431,10 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
       logInfo('[Retry] Ignoring stream failure while user-paused');
       return;
     }
+    if (aiSubtitlePreparingRef.current) {
+      logInfo('[Retry] Ignoring stream failure while AI subtitle is preparing');
+      return;
+    }
     if (isRetryingRef.current) {
       retryFailedDuringLoadRef.current = true;
       return;
@@ -1501,7 +1549,7 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
   const maybeRetryTrailerStream = useCallback(async (): Promise<boolean> => {
     const info = vodInfoRef.current;
     if (!info || (info.source_id !== 'trailer' && !isYouTubeUrl(info.url))) return false;
-    if (intentionallyStoppedRef.current || userPausedRef.current) return false;
+    if (intentionallyStoppedRef.current || userPausedRef.current || aiSubtitlePreparingRef.current) return false;
     if (Bridge.getIsCasting?.()) return false;
 
     const dur = durationRef.current;
@@ -1741,6 +1789,10 @@ export function usePlayback(options: UsePlaybackOptions): PlaybackState {
 
     const watchdog = setInterval(async () => {
       const now = Date.now();
+      if (aiSubtitlePreparingRef.current) {
+        lastHealthActivityTimeRef.current = now;
+        return;
+      }
       if (
         healthCheckInFlightRef.current ||
         isRetryingRef.current ||

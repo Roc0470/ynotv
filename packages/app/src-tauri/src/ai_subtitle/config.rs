@@ -7,8 +7,8 @@ use tauri::{AppHandle, Manager};
 use super::models::AiSubtitleConfig;
 
 const CONFIG_FILE_NAME: &str = "ynotv_ai_subtitle.json";
-const MIN_SYNC_OFFSET_MS: i32 = -6_000;
-const MAX_SYNC_OFFSET_MS: i32 = 6_000;
+const MIN_SYNC_OFFSET_MS: i32 = -15_000;
+const MAX_SYNC_OFFSET_MS: i32 = 15_000;
 
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 
@@ -141,7 +141,10 @@ mod tests {
         let directory = tempdir().unwrap();
         let path = directory.path().join("ynotv_ai_subtitle.json");
 
-        assert_eq!(read_config(&path).unwrap().model, "qwen-plus");
+        assert_eq!(
+            read_config(&path).unwrap().model,
+            "qwen3.8-livetranslate-flash-realtime"
+        );
 
         let config = AiSubtitleConfig {
             sync_offset_ms: 750,
@@ -161,19 +164,19 @@ mod tests {
         });
 
         assert_eq!(config.lead_seconds, 20);
-        assert_eq!(config.sync_offset_ms, 6_000);
+        assert_eq!(config.sync_offset_ms, 15_000);
     }
 
     #[test]
     fn sync_offset_adjustment_saturates_to_supported_range() {
         let mut config = AiSubtitleConfig {
-            sync_offset_ms: 5_900,
+            sync_offset_ms: 14_900,
             ..AiSubtitleConfig::default()
         };
         change_sync_offset(&mut config, 500);
-        assert_eq!(config.sync_offset_ms, 6_000);
+        assert_eq!(config.sync_offset_ms, 15_000);
         change_sync_offset(&mut config, i32::MIN);
-        assert_eq!(config.sync_offset_ms, -6_000);
+        assert_eq!(config.sync_offset_ms, -15_000);
     }
 
     #[test]

@@ -24,39 +24,25 @@ interface ConnectionTestResult {
 const PROVIDER_DEFAULTS: Record<AiSubtitleProvider, { label: string; model: string; baseUrl: string }> = {
   dash_scope: {
     label: '阿里百炼（DashScope）',
-    model: 'qwen-plus',
+    model: 'qwen3.8-livetranslate-flash-realtime',
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
   },
-  gemini: {
-    label: 'Google Gemini',
-    model: 'gemini-2.5-flash',
-    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions',
-  },
-  zhipu: {
-    label: '智谱 GLM',
-    model: 'glm-4-flash',
-    baseUrl: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
-  },
-  deep_seek: {
-    label: 'DeepSeek',
-    model: 'deepseek-chat',
-    baseUrl: 'https://api.deepseek.com/v1',
-  },
-  tvgo: {
-    label: 'TVGO',
-    model: 'qwen-plus',
-    baseUrl: 'http://127.0.0.1:11470/v1',
-  },
   open_ai_compatible: {
-    label: 'OpenAI 兼容服务',
-    model: 'qwen-plus',
+    label: '通用 API 接口（OpenAI 兼容）',
+    model: 'gpt-4o-mini',
     baseUrl: 'https://api.openai.com/v1',
   },
 };
 
+function normalizeProvider(provider: string | undefined): AiSubtitleProvider {
+  if (provider === 'dash_scope' || provider === 'open_ai_compatible') {
+    return provider;
+  }
+  return 'dash_scope';
+}
+
 function providerEndpoint(provider: AiSubtitleProvider): string {
-  if (provider === 'dash_scope') return PROVIDER_DEFAULTS.dash_scope.baseUrl;
-  return PROVIDER_DEFAULTS[provider].baseUrl;
+  return PROVIDER_DEFAULTS[normalizeProvider(provider)].baseUrl;
 }
 
 export function AiSubtitleSettingsModal({
@@ -82,7 +68,11 @@ export function AiSubtitleSettingsModal({
     invoke<AiSubtitleConfig>('ai_subtitle_get_config')
       .then((saved) => {
         if (!disposed) {
-          setConfig({ ...DEFAULT_AI_SUBTITLE_CONFIG, ...saved });
+          setConfig({
+            ...DEFAULT_AI_SUBTITLE_CONFIG,
+            ...saved,
+            provider: normalizeProvider(saved.provider),
+          });
           setApiKeyVisible(false);
         }
       })
@@ -213,16 +203,13 @@ export function AiSubtitleSettingsModal({
               <label className="ai-subtitle-setting-field">
                 <span>AI 服务商</span>
                 <select
-                  value={config.provider}
+                  value={normalizeProvider(config.provider)}
                   onChange={(event) => handleProviderChange(event.target.value as AiSubtitleProvider)}
                 >
                   {Object.entries(PROVIDER_DEFAULTS).map(([provider, item]) => (
                     <option key={provider} value={provider}>{item.label}</option>
                   ))}
                 </select>
-                {config.provider !== 'dash_scope' && (
-                  <small>该服务商的字幕引擎尚未接入；可保存并测试连接，但启动时会提示暂不支持。</small>
-                )}
               </label>
 
               <label className="ai-subtitle-setting-field">
@@ -268,7 +255,7 @@ export function AiSubtitleSettingsModal({
 
               <label className="ai-subtitle-setting-field">
                 <span className="ai-subtitle-range-heading">
-                  <span>字幕提前量</span>
+                  <span>直播延时缓冲</span>
                   <strong>{config.leadSeconds} 秒</strong>
                 </span>
                 <input
@@ -279,7 +266,7 @@ export function AiSubtitleSettingsModal({
                   value={config.leadSeconds}
                   onChange={(event) => setField('leadSeconds', Number(event.target.value))}
                 />
-                <small>启用时短暂暂停画面，为语音识别与翻译预留时间</small>
+                <small>启用时短暂暂停画面进行预缓冲，确保视频声音与译文字幕零延迟同步</small>
               </label>
 
               <div className="ai-subtitle-setting-field">
@@ -289,8 +276,8 @@ export function AiSubtitleSettingsModal({
                 </span>
                 <input
                   type="range"
-                  min={-6}
-                  max={6}
+                  min={-15}
+                  max={15}
                   step={0.1}
                   value={config.syncOffsetMs / 1000}
                   onChange={(event) => setField('syncOffsetMs', Math.round(Number(event.target.value) * 1000))}

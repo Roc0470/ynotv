@@ -15,27 +15,17 @@ use super::models::{
     AiSubtitleAudioSource, AiSubtitleConfig, AiSubtitleCue, AiSubtitleRoute, AiSubtitleState,
 };
 
-const PREPARATION_TIMEOUT: Duration = Duration::from_secs(8);
+// 海外代理直播源建连与首帧探测耗时较长，放宽至 12 秒避免误判超时并回退到直采。
+const PREPARATION_TIMEOUT: Duration = Duration::from_secs(12);
 const FIRST_TRANSLATION_WAIT: Duration = Duration::from_secs(3);
 const MAX_SCOUT_ATTEMPTS: u32 = 3;
 const SCOUT_RETRY_DELAY: Duration = Duration::from_millis(1_500);
 const MAX_CUE_HISTORY_MS: u64 = 60_000;
 const LATE_CUE_GRACE_MS: i128 = 4_000;
-/// Every displayed sentence holds for at least this long so it can be read.
+/// 每条字幕最短保持可读时长（毫秒）。
 const MIN_CUE_DISPLAY_MS: u64 = 2_000;
+/// 每条字幕最长自动延展可读时长（毫秒）。
 const MAX_CUE_DISPLAY_MS: u64 = 6_000;
-/// Queued sentences may only trail the picture by this much before the queue
-/// catches up (older sentences are cut short so the newest one shows).
-const MAX_DISPLAY_LAG_MS: u64 = 4_000;
-/// A sentence that is still streaming stays visible while more text arrives.
-const PARTIAL_REFRESH_MS: u64 = 1_500;
-/// A newly finalized sentence may replace the one on screen once it has been
-/// visible this long. Without this the queue would wait out every 2-6s reading
-/// window and captions would fall seconds behind the voice.
-const MIN_PREEMPT_HOLD_MS: u64 = 1_000;
-/// Direct-tap sessions have no prebuffer, so a finalized sentence is already
-/// behind the voice; allow it to take over after a shorter anti-flicker hold.
-const DIRECT_TAP_PREEMPT_HOLD_MS: u64 = 600;
 /// Temporary diagnostics counters for live subtitle troubleshooting.
 static DIAG_STATUS_LINES: AtomicU64 = AtomicU64::new(0);
 static DIAG_ACCEPT_LINES: AtomicU64 = AtomicU64::new(0);
@@ -50,14 +40,10 @@ struct ControllerInner {
     active: bool,
     phase_ready: bool,
     playback_advancing: bool,
+    /// 主播放器恢复播放后实际推进的播放时长（毫秒），与探路器 0ms 起步时间轴 1:1 对齐。
     main_played_pts_ms: u64,
-    /// Scout-timeline position that lines up with `main_played_pts_ms == 0`.
-    ///
-    /// Cues are timestamped on the audio scout clock, which starts as soon as the
-    /// scout connects, while the player clock only starts when playback resumes
-    /// after the prebuffer. Without this base the two timelines are off by the
-    /// whole prebuffer (the configured lead), so every caption shows up late.
-    cue_base_pts_ms: u64,
+    /// 共享给 FFmpeg 音频探路器的只读播放进度原子时钟，用于动态控速追赶。
+    shared_played_pts_ms: Arc<AtomicU64>,
     last_player_position_ms: Option<u64>,
     sync_offset_ms: i32,
     state: AiSubtitleState,
@@ -70,13 +56,8 @@ struct ControllerInner {
     paused_by_controller: bool,
     stream_url: Option<String>,
     headers: BTreeMap<String, String>,
-    /// Realtime translations arrive on the scout audio clock, which drifts far
-    /// ahead of the player clock, so their timestamps cannot be trusted. When
-    /// this flag is on, the controller re-anchors every cue to the render clock
-    /// and paces sentences through a display queue.
-    pace_cue_windows: bool,
-    /// Render time at which the next newly finished sentence may appear.
-    next_display_start_ms: Option<u64>,
+    /// 当 FFmpeg 探路不可用并回退到 WASAPI 直采时为 true，字幕到达即直接渲染。
+    direct_tap_mode: bool,
 }
 
 impl Default for AiSubtitleController {
@@ -94,7 +75,7 @@ impl AiSubtitleController {
                 phase_ready: false,
                 playback_advancing: false,
                 main_played_pts_ms: 0,
-                cue_base_pts_ms: 0,
+                shared_played_pts_ms: Arc::new(AtomicU64::new(0)),
                 last_player_position_ms: None,
                 sync_offset_ms: 0,
                 state: AiSubtitleState::Disabled,
@@ -107,8 +88,7 @@ impl AiSubtitleController {
                 paused_by_controller: false,
                 stream_url: None,
                 headers: BTreeMap::new(),
-                pace_cue_windows: false,
-                next_display_start_ms: None,
+                direct_tap_mode: false,
             })),
         }
     }
@@ -119,11 +99,23 @@ impl AiSubtitleController {
         stream_url: String,
         headers: HashMap<String, String>,
     ) -> Result<(), String> {
+        self.start_with_options(app, stream_url, headers, true).await
+    }
+
+    async fn start_with_options(
+        &self,
+        app: AppHandle,
+        stream_url: String,
+        headers: HashMap<String, String>,
+        reload_player: bool,
+    ) -> Result<(), String> {
         if stream_url.trim().is_empty() {
             return Err("直播流地址不能为空".to_string());
         }
         let mut config = super::config::get_current_config(&app)?;
         config.enabled = true;
+        // 新流启动时重置手动补偿偏移量为 0，保证 1:1 绝对时间轴开箱对齐。
+        config.sync_offset_ms = 0;
         let (cue_sender, cue_receiver) = mpsc::unbounded_channel();
         let mut engine_config = config.clone();
         if engine_config
@@ -133,17 +125,36 @@ impl AiSubtitleController {
         {
             engine_config.route = AiSubtitleRoute::Realtime;
         }
-        let pace_cue_windows = engine_config.route == AiSubtitleRoute::Realtime;
-        let mut engine = create_ai_subtitle_engine(engine_config, cue_sender)?;
+        let engine = create_ai_subtitle_engine(engine_config, cue_sender)?;
 
-        self.stop(&app).await?;
-        engine.start().await?;
+        // 停止旧会话时的任何非致命异常都不应中断新频道的字幕启动流程。
+        let _ = self.stop_internal(&app, false).await;
+        // 必须在拉起探路器前先暂停主播放器（若中途手动开启还需重载流清空旧缓存），防止初始化耗时或缓存错位导致字幕抢跑。
+        let prepare_player_result = if reload_player {
+            match reload_main_player(&app, stream_url.clone()).await {
+                Ok(()) => pause_main_player(&app).await,
+                Err(error) => Err(error),
+            }
+        } else {
+            pause_main_player(&app).await
+        };
+        if let Err(error) = prepare_player_result {
+            if let Ok(mut fallback_config) = super::config::get_current_config(&app) {
+                fallback_config.enabled = false;
+                if let Err(save_error) = super::config::update_config(&app, fallback_config) {
+                    log::error!(
+                        "[AiSubtitle] 暂停主播放器失败后禁用配置也失败: {save_error}"
+                    );
+                }
+            }
+            return Err(error);
+        }
         config = match super::config::update_config(&app, config) {
             Ok(config) => config,
             Err(error) => {
-                if let Err(stop_error) = engine.stop().await {
+                if let Err(resume_error) = resume_main_player(&app).await {
                     log::error!(
-                        "[AiSubtitle] Failed to stop engine after config persistence failed: {stop_error}"
+                        "[AiSubtitle] 持久化配置失败后恢复主播放器也失败: {resume_error}"
                     );
                 }
                 return Err(error);
@@ -153,24 +164,7 @@ impl AiSubtitleController {
         let cancellation = CancellationToken::new();
         let sorted_headers: BTreeMap<String, String> = headers.into_iter().collect();
 
-        if let Err(error) = pause_main_player(&app).await {
-            if let Err(stop_error) = engine.lock().await.stop().await {
-                log::error!(
-                    "[AiSubtitle] Failed to stop engine after player pause failed: {stop_error}"
-                );
-            }
-            if let Ok(mut config) = super::config::get_current_config(&app) {
-                config.enabled = false;
-                if let Err(save_error) = super::config::update_config(&app, config) {
-                    log::error!(
-                        "[AiSubtitle] Failed to disable config after player pause failed: {save_error}"
-                    );
-                }
-            }
-            return Err(error);
-        }
-
-        let generation = {
+        let (generation, player_played_ms) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -180,7 +174,7 @@ impl AiSubtitleController {
             inner.phase_ready = false;
             inner.playback_advancing = false;
             inner.main_played_pts_ms = 0;
-            inner.cue_base_pts_ms = 0;
+            inner.shared_played_pts_ms.store(0, Ordering::SeqCst);
             inner.last_player_position_ms = None;
             inner.sync_offset_ms = config.sync_offset_ms;
             inner.state = AiSubtitleState::Preparing {
@@ -195,10 +189,10 @@ impl AiSubtitleController {
             inner.paused_by_controller = true;
             inner.stream_url = Some(stream_url.clone());
             inner.headers = sorted_headers.clone();
-            inner.pace_cue_windows = pace_cue_windows;
-            inner.next_display_start_ms = None;
-            inner.generation
+            inner.direct_tap_mode = false;
+            (inner.generation, Arc::clone(&inner.shared_played_pts_ms))
         };
+        let _ = app.emit("ai-subtitle:sync-offset", config.sync_offset_ms);
         emit_state(
             &app,
             &AiSubtitleState::Preparing {
@@ -238,7 +232,8 @@ impl AiSubtitleController {
         let session_cancel = cancellation.clone();
         let session_url = stream_url;
         let session_headers = sorted_headers;
-        let lead_ms = config.lead_seconds as u64 * 1_000;
+        // 蓄水时长即为探路器提前于播放器起跑的提前量，保证 1:1 绝对时间轴对齐。
+        let lead_ms = (config.lead_seconds as u64).saturating_mul(1_000);
         let session_task = tokio::spawn(async move {
             run_session(
                 session_app,
@@ -249,6 +244,7 @@ impl AiSubtitleController {
                 engine,
                 lead_ms,
                 config.audio_source,
+                player_played_ms,
                 session_cancel,
             )
             .await;
@@ -266,6 +262,10 @@ impl AiSubtitleController {
     }
 
     pub async fn stop(&self, app: &AppHandle) -> Result<(), String> {
+        self.stop_internal(app, true).await
+    }
+
+    async fn stop_internal(&self, app: &AppHandle, resume_player: bool) -> Result<(), String> {
         let (cancellation, engine, workers, listener_id, should_resume, was_active) = {
             let mut inner = self
                 .inner
@@ -276,9 +276,9 @@ impl AiSubtitleController {
             inner.active = false;
             inner.phase_ready = false;
             inner.playback_advancing = false;
+            inner.direct_tap_mode = false;
             inner.cues.clear();
             inner.last_emitted_cue = None;
-            inner.next_display_start_ms = None;
             inner.state = AiSubtitleState::Disabled;
             (
                 inner.cancellation.take(),
@@ -293,46 +293,35 @@ impl AiSubtitleController {
         if let Some(cancellation) = cancellation {
             cancellation.cancel();
         }
-        for mut worker in workers {
-            match tokio::time::timeout(Duration::from_secs(2), &mut worker).await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    log::warn!("[AiSubtitle] Background task stopped with an error: {error}");
-                }
-                Err(_) => {
-                    worker.abort();
-                    let _ = worker.await;
-                }
-            }
+        for worker in workers {
+            worker.abort();
+            let _ = worker.await;
         }
-        let engine_result = if let Some(engine) = engine {
-            engine.lock().await.stop().await
-        } else {
-            Ok(())
-        };
-        if let Err(error) = &engine_result {
-            log::error!("[AiSubtitle] Failed to stop subtitle engine: {error}");
+        if let Some(engine) = engine {
+            if let Err(error) = engine.lock().await.stop().await {
+                log::warn!("[AiSubtitle] Failed to stop subtitle engine (ignored): {error}");
+            }
         }
         if let Some(listener_id) = listener_id {
             app.unlisten(listener_id);
         }
-        let resume_result = if should_resume {
-            resume_main_player(app).await
-        } else {
-            Ok(())
-        };
-        if let Err(error) = &resume_result {
-            log::error!("[AiSubtitle] Failed to resume player while stopping: {error}");
+        if should_resume && resume_player {
+            if let Err(error) = resume_main_player(app).await {
+                log::error!("[AiSubtitle] Failed to resume player while stopping: {error}");
+            }
         }
 
-        if was_active {
-            let mut config = super::config::get_current_config(app)?;
-            config.enabled = false;
-            super::config::update_config(app, config)?;
+        if was_active && resume_player {
+            if let Ok(mut config) = super::config::get_current_config(app) {
+                config.enabled = false;
+                if let Err(error) = super::config::update_config(app, config) {
+                    log::error!("[AiSubtitle] Failed to persist disabled config while stopping: {error}");
+                }
+            }
             emit_state(app, &AiSubtitleState::Disabled);
             let _ = app.emit("ai-subtitle:cue", Option::<AiSubtitleCue>::None);
         }
-        resume_result.and(engine_result)
+        Ok(())
     }
 
     pub async fn on_stream_changed(
@@ -341,15 +330,18 @@ impl AiSubtitleController {
         stream_url: String,
         headers: HashMap<String, String>,
     ) -> Result<bool, String> {
-        let is_active = self
-            .inner
-            .lock()
-            .map_err(|error| format!("AI 字幕控制器锁不可用：{error}"))?
-            .active;
+        let is_active = {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|error| format!("AI 字幕控制器锁不可用：{error}"))?;
+            inner.active
+        };
         if !is_active {
             return Ok(false);
         }
-        self.start(app, stream_url, headers).await?;
+        self.start_with_options(app, stream_url, headers, false)
+            .await?;
         Ok(true)
     }
 
@@ -419,16 +411,17 @@ async fn run_session(
     engine: SharedSubtitleEngine,
     lead_ms: u64,
     audio_source: AiSubtitleAudioSource,
+    player_played_ms: Arc<AtomicU64>,
     cancellation: CancellationToken,
 ) {
-    let initial_main_played_ms = main_clock(&inner, generation).unwrap_or(0);
-    let decoded_audio_ms = Arc::new(AtomicU64::new(initial_main_played_ms));
-    log::warn!(
-        "[AiSubtitleDiag] standalone decoded_audio init main_played={} decoded_initial={}",
-        initial_main_played_ms,
-        decoded_audio_ms.load(Ordering::SeqCst),
-    );
+    // 探路器与播放器蓄水后统一从 0ms 起步，直接 1:1 对齐时间轴。
+    let decoded_audio_ms = Arc::new(AtomicU64::new(0));
+    log::debug!("[AiSubtitleDiag] standalone decoded_audio init decoded_initial=0");
     if audio_source == AiSubtitleAudioSource::DirectTap {
+        if let Err(error) = engine.lock().await.start().await {
+            set_error(&app, &inner, generation, error).await;
+            return;
+        }
         start_direct_fallback(
             app,
             inner,
@@ -442,19 +435,44 @@ async fn run_session(
     }
 
     let mut scout_session = None;
+    let mut engine_started = false;
     let mut attempt = 0_u32;
     while attempt < MAX_SCOUT_ATTEMPTS {
         attempt += 1;
+        if attempt > 1 {
+            // 探路重试前重载并暂停主播放器，丢弃 mpv 旧缓存并与新启动的 FFmpeg 重新对齐在当前直播边缘。
+            let _ = reload_main_player(&app, stream_url.clone()).await;
+            let _ = pause_main_player(&app).await;
+            if cancellation.is_cancelled() {
+                return;
+            }
+            if let Ok(mut guard) = inner.lock() {
+                if guard.generation == generation {
+                    guard.main_played_pts_ms = 0;
+                    guard.shared_played_pts_ms.store(0, Ordering::SeqCst);
+                    guard.last_player_position_ms = None;
+                }
+            }
+        }
         let scout_cancel = cancellation.child_token();
+        // 先持有引擎锁再立即拉起 FFmpeg 进程，让 FFmpeg 建连/探测与百炼 WebSocket 握手并发执行。
+        let mut engine_guard = if !engine_started {
+            Some(engine.lock().await)
+        } else {
+            None
+        };
         let scout = match audio_scout::start_standalone(
             stream_url.clone(),
             headers.clone(),
             Arc::clone(&engine),
             Arc::clone(&decoded_audio_ms),
+            Arc::clone(&player_played_ms),
+            lead_ms,
             scout_cancel.clone(),
         ) {
             Ok(scout) => scout,
             Err(error) => {
+                drop(engine_guard);
                 log::warn!(
                     "[AiSubtitle] Standalone scout unavailable (attempt {attempt}/{MAX_SCOUT_ATTEMPTS}): {error}"
                 );
@@ -464,8 +482,27 @@ async fn run_session(
                 break;
             }
         };
+        if let Some(mut guard) = engine_guard.take() {
+            let start_result = tokio::select! {
+                _ = cancellation.cancelled() => {
+                    drop(guard);
+                    scout_cancel.cancel();
+                    let _ = scout.task.await;
+                    return;
+                }
+                result = guard.start() => result,
+            };
+            drop(guard);
+            if let Err(error) = start_result {
+                scout_cancel.cancel();
+                let _ = scout.task.await;
+                set_error(&app, &inner, generation, error).await;
+                return;
+            }
+            engine_started = true;
+        }
 
-        let mut task = scout.task;
+        let task = scout.task;
         let mut first_frame = scout.first_frame;
         let readiness = tokio::select! {
             _ = cancellation.cancelled() => {
@@ -501,6 +538,12 @@ async fn run_session(
     }
 
     let Some((mut task, standalone_cancel)) = scout_session else {
+        if !engine_started {
+            if let Err(error) = engine.lock().await.start().await {
+                set_error(&app, &inner, generation, error).await;
+                return;
+            }
+        }
         start_direct_fallback(
             app,
             inner,
@@ -555,14 +598,6 @@ async fn run_session(
                             "[AiSubtitle] No translated cue was ready within {}s of audio prebuffer; resuming playback",
                             FIRST_TRANSLATION_WAIT.as_secs()
                         );
-                    }
-                    if let Ok(mut state) = inner.lock() {
-                        if state.generation == generation {
-                            let scout_pts = decoded_audio_ms
-                                .load(Ordering::SeqCst)
-                                .min(state.main_played_pts_ms + lead_ms);
-                            sync_cue_base(&mut state, scout_pts);
-                        }
                     }
                     if let Err(error) = resume_main_player(&app).await {
                         set_error(&app, &inner, generation, error).await;
@@ -648,18 +683,7 @@ async fn run_session(
                 }
                 _ => {}
             }
-            return;
         }
-
-    start_direct_fallback(
-        app,
-        inner,
-        generation,
-        engine,
-        decoded_audio_ms,
-        cancellation,
-    )
-    .await;
 }
 
 /// Waits out a short backoff before retrying the audio scout.
@@ -715,8 +739,8 @@ async fn start_direct_fallback(
     }
     if let Ok(mut state) = inner.lock() {
         if state.generation == generation {
+            state.direct_tap_mode = true;
             state.paused_by_controller = false;
-            sync_cue_base(&mut state, start_pts_ms);
         }
     }
 
@@ -838,10 +862,9 @@ fn update_playback_status(
         let cue_to_emit = select_cue(&mut inner);
         let diag_line = if DIAG_STATUS_LINES.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
             Some(format!(
-                "[AiSubtitleDiag] tick render={} played={} base={} cues={} phase_ready={} advancing={} state={:?}",
-                inner.main_played_pts_ms.saturating_add(inner.cue_base_pts_ms),
+                "[AiSubtitleDiag] tick played={} direct_tap={} cues={} phase_ready={} advancing={} state={:?}",
                 inner.main_played_pts_ms,
-                inner.cue_base_pts_ms,
+                inner.direct_tap_mode,
                 inner.cues.len(),
                 inner.phase_ready,
                 inner.playback_advancing,
@@ -854,7 +877,7 @@ fn update_playback_status(
     };
 
     if let Some(diag_line) = diag_line {
-        log::warn!("{diag_line}");
+        log::debug!("{diag_line}");
     }
 
     if let Some(state) = state_to_emit {
@@ -876,62 +899,102 @@ fn accept_cue(
         if inner.generation != generation || !inner.active {
             return;
         }
-        let mut cue = cue;
-        let is_new = !inner.cues.iter().any(|item| item.id == cue.id);
-        if inner.pace_cue_windows {
-            if cue.is_partial {
-                let render_now_ms = inner
-                    .main_played_pts_ms
-                    .saturating_add(inner.cue_base_pts_ms);
-                hold_displayed_cue(&mut inner, render_now_ms);
-            }
-            if is_new {
-                assign_new_cue_window(&mut inner, &mut cue);
-            } else if let Some((existing_start, existing_end)) = inner
-                .cues
-                .iter()
-                .find(|item| item.id == cue.id)
-                .map(|item| (item.start_pts_ms, item.end_pts_ms))
-            {
-                let engine_start_pts_ms = cue.start_pts_ms;
-                cue.start_pts_ms = existing_start;
-                extend_cue_window(&mut inner, &mut cue, existing_end, engine_start_pts_ms);
-            }
-        }
-        let cue_start_pts_ms = cue.start_pts_ms;
-        let cue_end_pts_ms = cue.end_pts_ms;
         let cue_id = cue.id.clone();
         let is_partial = cue.is_partial;
         let source_chars = cue.source_text.chars().count();
         let translated_chars = cue.translated_text.chars().count();
-        if let Some(existing) = inner.cues.iter_mut().find(|item| item.id == cue.id) {
-            *existing = cue;
-        } else {
-            inner.cues.push_back(cue);
-        }
-        prune_cues(&mut inner);
-        let render_pts_ms = inner.main_played_pts_ms.saturating_add(inner.cue_base_pts_ms);
-        let cue_to_emit = select_cue(&mut inner);
+        let (is_new, cue_start_pts_ms, cue_end_pts_ms, cue_to_emit) =
+            apply_accepted_cue(&mut inner, cue);
         let selected = match &cue_to_emit {
             Some(Some(selected)) => selected.id.chars().take(8).collect::<String>(),
             Some(None) => "cleared".to_string(),
             None => "unchanged".to_string(),
         };
         let diag_line = format!(
-            "[AiSubtitleDiag] accept new={is_new} id={} partial={is_partial} start={cue_start_pts_ms} end={cue_end_pts_ms} src={source_chars} dst={translated_chars} render={render_pts_ms} played={} base={} selected={selected}",
+            "[AiSubtitleDiag] accept new={is_new} id={} partial={is_partial} start={cue_start_pts_ms} end={cue_end_pts_ms} src={source_chars} dst={translated_chars} played={} direct_tap={} selected={selected}",
             cue_id.chars().take(8).collect::<String>(),
             inner.main_played_pts_ms,
-            inner.cue_base_pts_ms,
+            inner.direct_tap_mode,
         );
         (cue_to_emit, Some(diag_line))
     };
     if let Some(diag_line) = diag_line {
         let sequence = DIAG_ACCEPT_LINES.fetch_add(1, Ordering::Relaxed);
         if sequence < 1_500 {
-            log::warn!("{diag_line}");
+            log::debug!("{diag_line}");
         }
     }
     emit_cue_update(app, cue_to_emit);
+}
+
+fn apply_accepted_cue(
+    inner: &mut ControllerInner,
+    mut cue: AiSubtitleCue,
+) -> (bool, u64, u64, Option<Option<AiSubtitleCue>>) {
+    let is_new = !inner.cues.iter().any(|item| item.id == cue.id);
+    if is_new && !is_non_empty_cue(&cue) {
+        return (false, cue.start_pts_ms, cue.end_pts_ms, None);
+    }
+
+    let source_chars = cue.source_text.chars().count();
+    let translated_chars = cue.translated_text.chars().count();
+    let duration_ms = display_duration_ms(source_chars, translated_chars);
+    cue.end_pts_ms = cue
+        .end_pts_ms
+        .max(cue.start_pts_ms.saturating_add(duration_ms));
+
+    if is_new {
+        // 迟到字幕重锚定保护：若新字幕起点已落后于当前播放进度，直接锚定至当前进度并赋予完整可读时长，永不丢弃。
+        if cue.start_pts_ms < inner.main_played_pts_ms {
+            cue.start_pts_ms = inner.main_played_pts_ms;
+            cue.end_pts_ms = cue.start_pts_ms.saturating_add(duration_ms);
+        }
+        // 单调递增保护：防止乱序分片导致新字幕起始时间早于队列末条。
+        if let Some(prev) = inner.cues.back() {
+            if cue.start_pts_ms < prev.start_pts_ms {
+                cue.start_pts_ms = prev.start_pts_ms;
+                cue.end_pts_ms = cue
+                    .end_pts_ms
+                    .max(cue.start_pts_ms.saturating_add(duration_ms));
+            }
+        }
+        // 将旧字幕的结束窗口截断至新字幕起始点，确保新字幕到来时立即无缝顶替。
+        for existing in inner.cues.iter_mut() {
+            if existing.end_pts_ms > cue.start_pts_ms {
+                existing.end_pts_ms = cue.start_pts_ms.max(existing.start_pts_ms);
+            }
+        }
+        let final_start = cue.start_pts_ms;
+        let final_end = cue.end_pts_ms;
+        inner.cues.push_back(cue);
+        prune_cues(inner);
+        return (true, final_start, final_end, select_cue(inner));
+    }
+
+    if let Some(existing) = inner.cues.iter_mut().find(|item| item.id == cue.id) {
+        // 同 ID 流式增量更新：若先前只有 ASR 杂音尚无译文而首次带入译文且被重锚定，则采纳更晚起点；否则保留最初起播时间戳并延长至最短可读时长。
+        if existing.translated_text.trim().is_empty() && !cue.translated_text.trim().is_empty() {
+            cue.start_pts_ms = existing.start_pts_ms.max(cue.start_pts_ms);
+        } else {
+            cue.start_pts_ms = existing.start_pts_ms;
+        }
+        cue.end_pts_ms = existing
+            .end_pts_ms
+            .max(cue.end_pts_ms)
+            .max(cue.start_pts_ms.saturating_add(duration_ms));
+        // 若流式增量更新到达时剩余显示窗口已不足最短可读时长，则顺延至当前进度之后，避免字幕闪烁或提前消失。
+        if cue.end_pts_ms < inner.main_played_pts_ms.saturating_add(MIN_CUE_DISPLAY_MS) {
+            cue.end_pts_ms = inner.main_played_pts_ms.saturating_add(duration_ms);
+        }
+        let final_start = cue.start_pts_ms;
+        let final_end = cue.end_pts_ms;
+        *existing = cue;
+        prune_cues(inner);
+        return (false, final_start, final_end, select_cue(inner));
+    }
+
+    prune_cues(inner);
+    (false, cue.start_pts_ms, cue.end_pts_ms, select_cue(inner))
 }
 
 fn advance_main_clock(
@@ -940,11 +1003,19 @@ fn advance_main_clock(
     playing: bool,
     paused_for_cache: bool,
 ) {
+    // 蓄水准备完成前冻结播放时钟，避免准备阶段残留的 mpv-status 事件提前推高时间轴。
+    if !inner.phase_ready {
+        inner.playback_advancing = false;
+        return;
+    }
     if let Some(last_position) = inner.last_player_position_ms {
         if playing && !paused_for_cache && position_ms >= last_position {
             inner.main_played_pts_ms = inner
                 .main_played_pts_ms
                 .saturating_add(position_ms.saturating_sub(last_position));
+            inner
+                .shared_played_pts_ms
+                .store(inner.main_played_pts_ms, Ordering::SeqCst);
         }
     }
     inner.last_player_position_ms = Some(position_ms);
@@ -952,9 +1023,7 @@ fn advance_main_clock(
 }
 
 fn prune_cues(inner: &mut ControllerInner) {
-    let render_pts_ms = inner
-        .main_played_pts_ms
-        .saturating_add(inner.cue_base_pts_ms);
+    let render_pts_ms = inner.main_played_pts_ms;
     while inner.cues.front().is_some_and(|cue| {
         render_pts_ms.saturating_sub(cue.end_pts_ms) > MAX_CUE_HISTORY_MS
     }) {
@@ -962,240 +1031,41 @@ fn prune_cues(inner: &mut ControllerInner) {
     }
 }
 
-/// Reading time for one sentence: roughly 11 characters per second with a
-/// floor of 2 seconds and a ceiling of 6 seconds. English source text counts
-/// at half weight because words are longer than Chinese characters.
+/// 根据原文/译文字符数计算字幕最短可读显示时长（2000ms ~ 6000ms）。
 fn display_duration_ms(source_chars: usize, translated_chars: usize) -> u64 {
     let effective_chars = translated_chars.max(source_chars / 2) as u64;
     (1_200 + effective_chars * 90).clamp(MIN_CUE_DISPLAY_MS, MAX_CUE_DISPLAY_MS)
 }
 
-/// Places a newly finished sentence on the render timeline at the moment the
-/// viewer will actually hear it. Engine timestamps live on the scout clock,
-/// which runs ahead of playback, so they are mapped through
-/// `cue_base_pts_ms` first; a sentence whose audio has already been heard
-/// starts right away. Sentences are then queued in order so they never
-/// overlap, and the queue is trimmed when it would trail the audio too far.
-fn assign_new_cue_window(inner: &mut ControllerInner, cue: &mut AiSubtitleCue) {
-    let render_now_ms = inner
-        .main_played_pts_ms
-        .saturating_add(inner.cue_base_pts_ms);
-    let engine_start_pts_ms = cue.start_pts_ms;
-    // The direct-tap fallback starts with an uncalibrated base of 0. On that
-    // path the sample-driven capture clock can run ahead of the player clock,
-    // so a future timestamp is drift, not audio the viewer has not heard yet.
-    // Anchor those sentences to the render clock instead of making them wait.
-    // 将 scout 时钟上的时间戳映射到画面渲染时钟：render = scout - cue_base_pts_ms
-    // 原代码错误地使用了 saturating_add，导致首条字幕的锚点偏差等于 cue_base_pts_ms
-    //（通常就是 lead_seconds 设置的秒数），表现为刚开播时字幕随机快/慢几秒。
-    let heard_at_ms = if inner.cue_base_pts_ms == 0 {
-        render_now_ms
-    } else {
-        cue.start_pts_ms
-            .saturating_sub(inner.cue_base_pts_ms)
-            .max(render_now_ms)
-    };
-    let mut start_pts_ms = inner
-        .next_display_start_ms
-        .take()
-        .unwrap_or(heard_at_ms)
-        .max(heard_at_ms);
-    if start_pts_ms.saturating_sub(heard_at_ms) > MAX_DISPLAY_LAG_MS {
-        start_pts_ms = heard_at_ms;
-    }
-    let end_pts_ms = start_pts_ms.saturating_add(display_duration_ms(
-        cue.source_text.chars().count(),
-        cue.translated_text.chars().count(),
-    ));
-    cue.start_pts_ms = start_pts_ms;
-    cue.end_pts_ms = end_pts_ms;
-    inner.next_display_start_ms = Some(end_pts_ms);
-    preempt_finished_cue(inner, cue, render_now_ms, engine_start_pts_ms);
-}
-
-/// A sentence that just became final may take over the screen once the
-/// sentence before it has been visible for `MIN_PREEMPT_HOLD_MS`, instead of
-/// waiting out that sentence's full 2-6s reading window. Without this the
-/// display queue builds a 2-4s lag behind the voice.
-fn preempt_finished_cue(
-    inner: &mut ControllerInner,
-    cue: &mut AiSubtitleCue,
-    render_now_ms: u64,
-    engine_start_pts_ms: u64,
-) -> bool {
-    if cue.is_partial {
-        return false;
-    }
-    let direct_tap = inner.cue_base_pts_ms == 0;
-    // Outside the direct-tap path the engine timestamp is ahead of playback; a
-    // sentence may only take over once its audio has actually been heard.
-    // engine_start_pts_ms 是 scout 时钟，render_now_ms 是画面时钟，需减去 cue_base_pts_ms 对齐。
-    let audio_reached = engine_start_pts_ms
-        .saturating_sub(inner.cue_base_pts_ms)
-        <= render_now_ms;
-    if !direct_tap && !audio_reached {
-        return false;
-    }
-    let Some((prev_start_ms, prev_end_ms)) = inner
-        .cues
-        .iter()
-        .rev()
-        .find(|item| item.id != cue.id && !item.is_partial)
-        .map(|item| (item.start_pts_ms, item.end_pts_ms))
-    else {
-        // Nothing is on screen yet, so the normal placement already starts this
-        // sentence immediately; there is no tail to cut short.
-        return false;
-    };
-    let target_start_ms = if direct_tap {
-        // No prebuffer means the audio has already been heard: the only wait
-        // allowed is a short anti-flicker hold after the previous sentence.
-        render_now_ms.max(prev_start_ms.saturating_add(DIRECT_TAP_PREEMPT_HOLD_MS))
-    } else {
-        // The previous sentence has already left the screen, so the normal
-        // "start right now" path handles this cue.
-        if prev_end_ms <= render_now_ms {
-            return false;
-        }
-        render_now_ms.max(prev_start_ms.saturating_add(MIN_PREEMPT_HOLD_MS))
-    };
-    // Cut the older sentences short so `select_cue` switches to this one at
-    // `target_start_ms` instead of waiting out their remaining tails. When the
-    // target is "now", end them just before now so this tick must pick the new
-    // sentence.
-    let zero_latency = target_start_ms == render_now_ms;
-    for item in inner.cues.iter_mut() {
-        if item.id == cue.id {
-            continue;
-        }
-        if zero_latency {
-            if item.end_pts_ms >= render_now_ms {
-                item.end_pts_ms = render_now_ms.saturating_sub(1);
-            }
-        } else if item.end_pts_ms > target_start_ms {
-            item.end_pts_ms = target_start_ms.max(item.start_pts_ms.saturating_add(1));
-        }
-    }
-    cue.start_pts_ms = target_start_ms;
-    cue.end_pts_ms = target_start_ms.saturating_add(display_duration_ms(
-        cue.source_text.chars().count(),
-        cue.translated_text.chars().count(),
-    ));
-    inner.next_display_start_ms = Some(target_start_ms.saturating_add(MIN_PREEMPT_HOLD_MS));
-    true
-}
-
-/// Refreshes the window of a sentence that is still arriving or has just been
-/// finalized, keeping the slot it already holds on the render timeline.
-/// `stored_end_ms` is the slot end previously assigned by the controller; the
-/// engine's raw timestamps must not leak back into the render timeline.
-fn extend_cue_window(
-    inner: &mut ControllerInner,
-    cue: &mut AiSubtitleCue,
-    stored_end_ms: u64,
-    engine_start_pts_ms: u64,
-) {
-    let render_now_ms = inner
-        .main_played_pts_ms
-        .saturating_add(inner.cue_base_pts_ms);
-    // A sentence that just became final may take the screen over early.
-    if preempt_finished_cue(inner, cue, render_now_ms, engine_start_pts_ms) {
-        return;
-    }
-    let duration_ms = display_duration_ms(
-        cue.source_text.chars().count(),
-        cue.translated_text.chars().count(),
-    );
-    // A finished sentence is shown as soon as its polished translation lands.
-    // If that happens after its audio slot, re-anchor the slot to "now" so the
-    // viewer still gets the full reading time instead of a flicker.
-    if !cue.is_partial && cue.start_pts_ms < render_now_ms {
-        cue.start_pts_ms = render_now_ms;
-    }
-    let max_end_ms = cue
-        .start_pts_ms
-        .saturating_add(MAX_CUE_DISPLAY_MS);
-    let desired_end_ms = if cue.is_partial {
-        render_now_ms.saturating_add(PARTIAL_REFRESH_MS)
-    } else {
-        cue.start_pts_ms.saturating_add(duration_ms)
-    };
-    cue.end_pts_ms = stored_end_ms
-        .max(desired_end_ms)
-        .min(max_end_ms)
-        .max(cue.start_pts_ms.saturating_add(1));
-    let next = inner.next_display_start_ms.get_or_insert(cue.end_pts_ms);
-    if *next < cue.end_pts_ms {
-        *next = cue.end_pts_ms;
-    }
-}
-
-/// Keeps the sentence that is currently on screen alive while the next one is
-/// still waiting for its first translated character, so the subtitle never
-/// blinks out between sentences.
-fn hold_displayed_cue(inner: &mut ControllerInner, render_now_ms: u64) {
-    let Some(shown_id) = inner.last_emitted_cue.as_ref().map(|cue| cue.id.clone()) else {
-        return;
-    };
-    let Some(shown_start_ms) = inner
-        .cues
-        .iter()
-        .find(|cue| cue.id == shown_id)
-        .map(|cue| cue.start_pts_ms)
-    else {
-        return;
-    };
-    // Never stretch the sentence on screen over a newer sentence that has
-    // already been finalized and is waiting for its turn.
-    let newer_finished_waiting = inner.cues.iter().any(|cue| {
-        cue.id != shown_id && !cue.is_partial && cue.start_pts_ms >= shown_start_ms
-    });
-    if newer_finished_waiting {
-        return;
-    }
-    if let Some(shown) = inner.cues.iter_mut().find(|cue| cue.id == shown_id) {
-        let hold_until_ms = render_now_ms
-            .saturating_add(PARTIAL_REFRESH_MS)
-            .min(shown.start_pts_ms.saturating_add(MAX_CUE_DISPLAY_MS));
-        shown.end_pts_ms = shown.end_pts_ms.max(hold_until_ms);
-    }
+fn is_non_empty_cue(cue: &AiSubtitleCue) -> bool {
+    !cue.source_text.trim().is_empty() || !cue.translated_text.trim().is_empty()
 }
 
 fn select_cue(inner: &mut ControllerInner) -> Option<Option<AiSubtitleCue>> {
     if !inner.phase_ready || !inner.playback_advancing {
         return None;
     }
-    let render_pts_ms = i128::from(
-        inner
-            .main_played_pts_ms
-            .saturating_add(inner.cue_base_pts_ms),
-    );
-    let sync_offset_ms = i128::from(inner.sync_offset_ms);
-    let cue_base_pts_ms = i128::from(inner.cue_base_pts_ms);
-    let paced = inner.pace_cue_windows;
-    // Show partial (streaming) translations as soon as they arrive so the
-    // viewer does not have to wait for the whole sentence to be translated.
-    // Finished sentences still take over when their window arrives.
-    let showable = |_cue: &AiSubtitleCue| true;
-    let cue = inner
-        .cues
-        .iter()
-            .rev()
-            .find(|cue| {
-                showable(cue)
-                && i128::from(cue.start_pts_ms) + cue_base_pts_ms + sync_offset_ms <= render_pts_ms
-                && i128::from(cue.end_pts_ms) + cue_base_pts_ms + sync_offset_ms >= render_pts_ms
-            })
-        .or_else(|| {
-            inner.cues.iter().rev().find(|cue| {
-                showable(cue)
-                    && i128::from(cue.start_pts_ms) + cue_base_pts_ms + sync_offset_ms <= render_pts_ms
-                    && render_pts_ms > i128::from(cue.end_pts_ms) + cue_base_pts_ms + sync_offset_ms
-                    && render_pts_ms
-                        - (i128::from(cue.end_pts_ms) + cue_base_pts_ms + sync_offset_ms)
-                        <= LATE_CUE_GRACE_MS
-            })
-        });
+
+    let cue = if inner.direct_tap_mode {
+        // WASAPI 直采模式下音频已实时产出，跳过提前量匹配，直接显示未超过宽限期的最新非空字幕。
+        let grace_ms = u64::try_from(LATE_CUE_GRACE_MS).unwrap_or(0);
+        inner.cues.iter().rev().find(|cue| {
+            is_non_empty_cue(cue)
+                && inner.main_played_pts_ms <= cue.end_pts_ms.saturating_add(grace_ms)
+        })
+    } else {
+        // 独立探路模式下，探路音频流（0ms 起步）与播放器实际播放进度（0ms 起步）1:1 对齐。
+        let render_pts_ms = i128::from(inner.main_played_pts_ms);
+        let sync_offset_ms = i128::from(inner.sync_offset_ms);
+        inner.cues.iter().rev().find(|cue| {
+            let shifted_start = i128::from(cue.start_pts_ms) + sync_offset_ms;
+            let shifted_end = i128::from(cue.end_pts_ms) + sync_offset_ms;
+            is_non_empty_cue(cue)
+                && shifted_start <= render_pts_ms
+                && render_pts_ms <= shifted_end + LATE_CUE_GRACE_MS
+        })
+    };
+
     if let Some(cue) = cue {
         if inner.last_emitted_cue.as_ref() == Some(cue) {
             return None;
@@ -1208,24 +1078,15 @@ fn select_cue(inner: &mut ControllerInner) -> Option<Option<AiSubtitleCue>> {
             return None;
         }
         let cue_start_pts_ms = cue.start_pts_ms;
-        let jumped = inner
-            .last_emitted_cue
-            .as_ref()
-            .is_some_and(|last| cue_start_pts_ms < last.start_pts_ms);
-        let latest_audio_pts_ms = inner
-            .main_played_pts_ms
-            .saturating_add(inner.cue_base_pts_ms);
-        let backlog_ms = latest_audio_pts_ms.saturating_sub(cue_start_pts_ms);
+        let backlog_ms = inner.main_played_pts_ms.saturating_sub(cue_start_pts_ms);
         inner.last_emitted_cue = Some(cue.clone());
-        log::warn!(
-            "[AiSubtitleDiag] show id={} audio_pts={} display_pts={} base={} delta={} backlog_ms={} jumped={}",
+        log::debug!(
+            "[AiSubtitleDiag] show id={} cue_start={} played={} direct_tap={} backlog_ms={}",
             cue.id.chars().take(8).collect::<String>(),
             cue_start_pts_ms,
-            render_pts_ms,
-            inner.cue_base_pts_ms,
-            render_pts_ms - (i128::from(cue_start_pts_ms) + i128::from(inner.cue_base_pts_ms)),
+            inner.main_played_pts_ms,
+            inner.direct_tap_mode,
             backlog_ms,
-            jumped,
         );
         Some(Some(cue.clone()))
     } else if inner.last_emitted_cue.take().is_some() {
@@ -1245,32 +1106,6 @@ fn emit_cue_update(app: &AppHandle, cue_update: Option<Option<AiSubtitleCue>>) {
         }
         None => {}
     }
-}
-
-/// Aligns the scout timeline with the player timeline the moment playback resumes:
-/// `scout_pts` points at the audio the viewer is hearing right now, so every later
-/// player position maps to `scout_pts + elapsed`.
-fn sync_cue_base(inner: &mut ControllerInner, scout_pts_ms: u64) {
-    let new_base_pts_ms = scout_pts_ms.saturating_sub(inner.main_played_pts_ms);
-    log::warn!(
-        "[AiSubtitleDiag] sync_cue_base scout_pts={} main_played={} new_base={}",
-        scout_pts_ms,
-        inner.main_played_pts_ms,
-        new_base_pts_ms,
-    );
-    if inner.pace_cue_windows && new_base_pts_ms > inner.cue_base_pts_ms {
-        // Cues accepted before playback resumed were paced on a render clock
-        // that had not started yet; shift their slots onto the real timeline.
-        let delta_ms = new_base_pts_ms - inner.cue_base_pts_ms;
-        for cue in &mut inner.cues {
-            cue.start_pts_ms = cue.start_pts_ms.saturating_add(delta_ms);
-            cue.end_pts_ms = cue.end_pts_ms.saturating_add(delta_ms);
-        }
-        if let Some(next) = inner.next_display_start_ms.as_mut() {
-            *next = next.saturating_add(delta_ms);
-        }
-    }
-    inner.cue_base_pts_ms = new_base_pts_ms;
 }
 
 fn mark_running(app: &AppHandle, inner: &Arc<Mutex<ControllerInner>>, generation: u64) {
@@ -1413,6 +1248,14 @@ fn emit_state(app: &AppHandle, state: &AiSubtitleState) {
     let _ = app.emit("ai-subtitle:state", state);
 }
 
+async fn reload_main_player(app: &AppHandle, url: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    if crate::get_player_engine(app).await == crate::PlayerEngine::Sidecar {
+        return crate::mpv_windows::load_file(app, url).await;
+    }
+    crate::mpv_core::load_file(app, url).await
+}
+
 async fn pause_main_player(app: &AppHandle) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     if crate::get_player_engine(app).await == crate::PlayerEngine::Sidecar {
@@ -1507,12 +1350,12 @@ pub fn ai_subtitle_sync_now(
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_main_clock, assign_new_cue_window, display_duration_ms, extend_cue_window,
-        has_translated_cue, hold_displayed_cue, select_cue, sync_cue_base, ControllerInner,
-        MIN_CUE_DISPLAY_MS,
+        advance_main_clock, apply_accepted_cue, display_duration_ms, has_translated_cue,
+        select_cue, ControllerInner, MAX_CUE_DISPLAY_MS, MIN_CUE_DISPLAY_MS,
     };
     use crate::ai_subtitle::models::{AiSubtitleCue, AiSubtitleState};
     use std::collections::{BTreeMap, VecDeque};
+    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
 
     fn test_inner() -> ControllerInner {
@@ -1522,7 +1365,7 @@ mod tests {
             phase_ready: true,
             playback_advancing: true,
             main_played_pts_ms: 1_500,
-            cue_base_pts_ms: 0,
+            shared_played_pts_ms: Arc::new(AtomicU64::new(1_500)),
             last_player_position_ms: None,
             sync_offset_ms: 0,
             state: AiSubtitleState::Running,
@@ -1535,8 +1378,7 @@ mod tests {
             paused_by_controller: false,
             stream_url: None,
             headers: BTreeMap::new(),
-            pace_cue_windows: false,
-            next_display_start_ms: None,
+            direct_tap_mode: false,
         }
     }
 
@@ -1557,6 +1399,26 @@ mod tests {
         advance_main_clock(&mut inner, 8_000, false, false);
         assert_eq!(inner.main_played_pts_ms, 1_000);
         assert!(!inner.playback_advancing);
+    }
+
+    #[test]
+    fn playback_clock_stays_zero_until_phase_ready() {
+        let mut inner = test_inner();
+        inner.phase_ready = false;
+        inner.main_played_pts_ms = 0;
+        inner.last_player_position_ms = None;
+
+        advance_main_clock(&mut inner, 1_000, true, false);
+        advance_main_clock(&mut inner, 2_500, true, false);
+        assert_eq!(inner.main_played_pts_ms, 0);
+        assert_eq!(inner.last_player_position_ms, None);
+        assert!(!inner.playback_advancing);
+
+        inner.phase_ready = true;
+        advance_main_clock(&mut inner, 2_500, true, false);
+        advance_main_clock(&mut inner, 3_000, true, false);
+        assert_eq!(inner.main_played_pts_ms, 500);
+        assert!(inner.playback_advancing);
     }
 
     #[test]
@@ -1714,318 +1576,161 @@ mod tests {
         );
     }
 
-    fn paced_cue(id: &str, start_pts_ms: u64, end_pts_ms: u64) -> AiSubtitleCue {
+    fn sample_cue(id: &str, source_text: &str, translated_text: &str, start_pts_ms: u64, end_pts_ms: u64) -> AiSubtitleCue {
         AiSubtitleCue {
             id: id.to_string(),
-            source_text: String::new(),
-            translated_text: String::new(),
+            source_text: source_text.to_string(),
+            translated_text: translated_text.to_string(),
             start_pts_ms,
             end_pts_ms,
-            is_partial: true,
-        }
-    }
-
-    #[test]
-    fn paced_cues_appear_when_the_viewer_hears_them() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 100_000;
-        inner.cue_base_pts_ms = 20_000;
-        // The calibrated scout clock is 20s ahead of playback: the sentence's
-        // audio at 120s on the scout clock is heard 20s from now, so its window
-        // starts there.
-        let mut cue = paced_cue("scout-cue", 120_000, 125_000);
-
-        assign_new_cue_window(&mut inner, &mut cue);
-
-        assert_eq!(cue.start_pts_ms, 120_000);
-        assert_eq!(cue.end_pts_ms, 122_000);
-        assert_eq!(inner.next_display_start_ms, Some(122_000));
-    }
-
-    #[test]
-    fn uncalibrated_direct_tap_does_not_wait_for_the_capture_clock() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.cue_base_pts_ms = 0;
-        inner.main_played_pts_ms = 100_000;
-        // The direct tap clock is 2.4s ahead of the render clock. That future
-        // timestamp is drift, not audio the viewer has not heard yet, so the
-        // finished sentence must start now instead of waiting 2.4s.
-        let mut cue = paced_cue("direct-tap-cue", 102_400, 105_000);
-
-        assign_new_cue_window(&mut inner, &mut cue);
-
-        assert_eq!(cue.start_pts_ms, 100_000);
-        assert_eq!(cue.end_pts_ms, 102_000);
-        assert_eq!(inner.next_display_start_ms, Some(102_000));
-    }
-
-    #[test]
-    fn paced_cues_whose_audio_was_already_heard_start_immediately() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 100_000;
-        // This sentence belongs to audio 5s in the past (translation lagged).
-        let mut cue = paced_cue("late-cue", 95_000, 98_000);
-
-        assign_new_cue_window(&mut inner, &mut cue);
-
-        assert_eq!(cue.start_pts_ms, 100_000);
-        assert_eq!(cue.end_pts_ms, 102_000);
-    }
-
-    #[test]
-    fn paced_sentences_queue_one_after_another_with_a_minimum_hold() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 50_000;
-
-        for index in 0..3 {
-            let mut cue = paced_cue(&format!("cue-{index}"), 50_000, 55_000);
-            assign_new_cue_window(&mut inner, &mut cue);
-            assert_eq!(cue.start_pts_ms, 50_000 + index * MIN_CUE_DISPLAY_MS);
-        }
-        assert_eq!(inner.next_display_start_ms, Some(56_000));
-    }
-
-    #[test]
-    fn paced_queue_is_trimmed_once_it_trails_the_audio_by_four_seconds() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 50_000;
-        inner.cue_base_pts_ms = 10_000;
-
-        for index in 0..4 {
-            let mut cue = paced_cue(
-                &format!("cue-{index}"),
-                50_000 + index * MIN_CUE_DISPLAY_MS,
-                55_000,
-            );
-            assign_new_cue_window(&mut inner, &mut cue);
-        }
-        assert_eq!(inner.next_display_start_ms, Some(62_000));
-
-        // The next sentence is already being heard, but the queue would hold it
-        // back; the cap trims the wait so it shows right away.
-        let mut next = paced_cue("queued-cue", 50_000, 55_000);
-        assign_new_cue_window(&mut inner, &mut next);
-
-        assert_eq!(next.start_pts_ms, 62_000);
-        assert_eq!(inner.next_display_start_ms, Some(64_000));
-    }
-
-    #[test]
-    fn finalized_sentences_hold_for_their_reading_time() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 10_000;
-        let mut cue = paced_cue("final-cue", 10_000, 12_000);
-        assign_new_cue_window(&mut inner, &mut cue);
-        assert_eq!(cue.end_pts_ms, 12_000);
-
-        cue.is_partial = false;
-        cue.translated_text = "这是一个大约二十个字的句子用来测试时长。".to_string();
-        extend_cue_window(&mut inner, &mut cue, 12_000, 10_000);
-        let expected_end =
-            cue.start_pts_ms + display_duration_ms(0, cue.translated_text.chars().count());
-        assert_eq!(cue.end_pts_ms, expected_end);
-        assert!(cue.end_pts_ms > 12_000);
-    }
-
-    #[test]
-    fn partial_sentences_are_shown_as_they_stream() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 1_500;
-        inner.cues.push_back(AiSubtitleCue {
-            id: "streaming".to_string(),
-            source_text: "Hello".to_string(),
-            translated_text: String::new(),
-            start_pts_ms: 1_000,
-            end_pts_ms: 3_000,
-            is_partial: true,
-        });
-
-        // Partial sentences are shown as soon as they arrive instead of
-        // waiting for the full translation.
-        assert!(select_cue(&mut inner).unwrap().is_some());
-
-        // Streaming translation updates the same cue and re-emits it.
-        inner.cues[0].translated_text = "你好".to_string();
-        assert!(select_cue(&mut inner).unwrap().is_some());
-
-        // A finalized sentence is also shown.
-        inner.cues[0].is_partial = false;
-        assert!(select_cue(&mut inner).unwrap().is_some());
-    }
-
-    #[test]
-    fn a_finished_sentence_that_arrives_late_gets_a_full_reading_slot() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 10_000;
-        let mut cue = paced_cue("late-final", 10_000, 12_000);
-        assign_new_cue_window(&mut inner, &mut cue);
-
-        // The polished translation only lands 3s after the audio slot started.
-        inner.main_played_pts_ms = 13_000;
-        cue.is_partial = false;
-        cue.translated_text = "你好世界".to_string();
-        let stored_end = cue.end_pts_ms;
-        extend_cue_window(&mut inner, &mut cue, stored_end, 10_000);
-
-        assert_eq!(cue.start_pts_ms, 13_000);
-        assert_eq!(cue.end_pts_ms, 13_000 + display_duration_ms(0, 4));
-    }
-
-    #[test]
-    fn an_untranslated_sentence_keeps_the_displayed_one_alive() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 1_500;
-        inner.cues.push_back(AiSubtitleCue {
-            id: "shown".to_string(),
-            source_text: "Hello".to_string(),
-            translated_text: "你好".to_string(),
-            start_pts_ms: 1_000,
-            end_pts_ms: 2_000,
             is_partial: false,
-        });
-        assert!(select_cue(&mut inner).unwrap().is_some());
-
-        hold_displayed_cue(&mut inner, 2_500);
-
-        assert_eq!(inner.cues[0].end_pts_ms, 4_000);
-    }
-
-    #[test]
-    fn partial_windows_stop_growing_at_the_maximum_hold() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 10_000;
-        let mut cue = paced_cue("long-partial", 10_000, 12_000);
-        assign_new_cue_window(&mut inner, &mut cue);
-
-        let mut stored_end = cue.end_pts_ms;
-        for step in 1..=6 {
-            inner.main_played_pts_ms = 10_000 + step * 1_000;
-            extend_cue_window(&mut inner, &mut cue, stored_end, 10_000);
-            stored_end = cue.end_pts_ms;
         }
-
-        // The window may slide forward while text streams in, but it must stop
-        // at start + 6s so it can never outlive the sentences that follow it.
-        assert_eq!(cue.end_pts_ms, 16_000);
     }
 
     #[test]
-    fn refreshing_a_window_ignores_the_engines_future_timestamps() {
+    fn apply_accepted_cue_enforces_display_duration_bounds_and_ignores_empty() {
         let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.main_played_pts_ms = 10_000;
-        let mut cue = paced_cue("engine-end-cue", 10_000, 12_000);
-        assign_new_cue_window(&mut inner, &mut cue);
+        inner.main_played_pts_ms = 1_000;
 
-        // The engine stamps this sentence with its scout-clock end (125s), which
-        // is far in the future; it must not stretch the paced window.
-        cue.end_pts_ms = 125_000;
-        cue.is_partial = false;
-        extend_cue_window(&mut inner, &mut cue, 12_000, 10_000);
-
-        assert_eq!(cue.end_pts_ms, 12_000);
-        assert_eq!(inner.next_display_start_ms, Some(12_000));
-    }
-
-    #[test]
-    fn a_newly_finalized_sentence_preempts_after_a_short_direct_tap_hold() {
-        let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.cue_base_pts_ms = 0;
-        inner.main_played_pts_ms = 10_000;
-
-        // The first sentence owns the screen with a full reading window.
-        let mut first = paced_cue("first-cue", 10_000, 12_000);
-        first.is_partial = false;
-        first.translated_text = "第一句已经定稿".to_string();
-        assign_new_cue_window(&mut inner, &mut first);
-        assert_eq!(first.end_pts_ms, 12_000);
-        inner.cues.push_back(first);
-
-        // The next sentence is already final but was queued behind the first
-        // one's tail. On the direct tap it takes over 600ms after the first
-        // one appeared.
-        inner.main_played_pts_ms = 10_500;
-        let mut second = paced_cue("second-cue", 10_200, 12_000);
-        second.is_partial = false;
-        second.translated_text = "第二句也已经定稿".to_string();
-        inner.cues.push_back(second.clone());
-        let stored_end = second.end_pts_ms;
-        extend_cue_window(&mut inner, &mut second, stored_end, 10_200);
-
-        assert_eq!(second.start_pts_ms, 10_600);
-        assert_eq!(inner.cues[0].end_pts_ms, 10_600);
-        assert_eq!(
-            second.end_pts_ms,
-            10_600 + display_duration_ms(0, second.translated_text.chars().count())
+        // 空文本新字幕直接忽略，不污染队列。
+        let (is_new, _, _, emitted) = apply_accepted_cue(
+            &mut inner,
+            sample_cue("empty-cue", "   ", "\n", 1_000, 1_500),
         );
-        assert_eq!(inner.next_display_start_ms, Some(11_600));
+        assert!(!is_new);
+        assert!(emitted.is_none());
+        assert!(inner.cues.is_empty());
 
-        // At the handover instant the new sentence is the one on screen.
-        inner.main_played_pts_ms = 10_600;
-        let shown = select_cue(&mut inner).unwrap().unwrap();
-        assert_eq!(shown.id, "second-cue");
+        // 最短显示时长保护（2000ms）。
+        assert_eq!(display_duration_ms(2, 2), MIN_CUE_DISPLAY_MS);
+        let (_, start, end, _) = apply_accepted_cue(
+            &mut inner,
+            sample_cue("short-cue", "hi", "嗨", 1_000, 1_200),
+        );
+        assert_eq!(start, 1_000);
+        assert_eq!(end, 1_000 + MIN_CUE_DISPLAY_MS);
+
+        // 最长自动延展阅读时长上限（6000ms）。
+        let long_text = "这是一段超过六十个字符的超长翻译字幕内容用于校验最短阅读时长计算上限不会无限制放大到超出六秒钟".repeat(2);
+        assert_eq!(
+            display_duration_ms(0, long_text.chars().count()),
+            MAX_CUE_DISPLAY_MS
+        );
     }
 
     #[test]
-    fn a_direct_tap_sentence_takes_over_on_the_current_tick_once_the_old_one_has_aged() {
+    fn apply_accepted_cue_keeps_monotonic_start_and_truncates_previous_cues() {
         let mut inner = test_inner();
-        inner.pace_cue_windows = true;
-        inner.cue_base_pts_ms = 0;
-        inner.main_played_pts_ms = 12_000;
-        inner.cues.push_back(AiSubtitleCue {
-            id: "old-cue".to_string(),
-            source_text: "Old".to_string(),
-            translated_text: "旧句子还在屏幕上".to_string(),
-            start_pts_ms: 10_000,
-            end_pts_ms: 15_000,
-            is_partial: false,
-        });
+        inner.main_played_pts_ms = 500;
 
-        let mut cue = paced_cue("new-cue", 11_800, 13_000);
-        cue.is_partial = false;
-        cue.translated_text = "新句子已经定稿".to_string();
-        // In the real accept path the cue is already stored before the window is
-        // refreshed, so mirror that here.
-        inner.cues.push_back(cue.clone());
-        let stored_end = cue.end_pts_ms;
-        extend_cue_window(&mut inner, &mut cue, stored_end, 11_800);
+        // 第 1 句（流式半成品 -> 增量更新）。
+        let mut first_partial = sample_cue("cue-1", "Hello", "你好", 1_000, 1_500);
+        first_partial.is_partial = true;
+        let (is_new, start, end, emitted) = apply_accepted_cue(&mut inner, first_partial);
+        assert!(is_new);
+        assert_eq!(start, 1_000);
+        assert_eq!(end, 3_000);
+        assert!(emitted.is_none());
 
-        // The old sentence has been visible for 2s, so the new one starts now
-        // and the old one ends just before now so this tick selects the new one.
-        assert_eq!(cue.start_pts_ms, 12_000);
-        assert_eq!(inner.cues[0].end_pts_ms, 11_999);
-        let shown = select_cue(&mut inner).unwrap().unwrap();
-        assert_eq!(shown.id, "new-cue");
+        // 同 ID 流式更新，保留最初 start_pts_ms 并延长窗口。
+        let updated = sample_cue("cue-1", "Hello everyone", "大家好，欢迎收看本期节目", 2_200, 2_400);
+        let (is_new, start, end, _) = apply_accepted_cue(&mut inner, updated);
+        assert!(!is_new);
+        assert_eq!(start, 1_000);
+        assert!(end >= 3_000);
+
+        // 第 2 句在 2_500ms 到达：旧句 end_pts_ms 应被截断为 2_500ms，避免遮挡新句。
+        let (is_new, start, _, _) = apply_accepted_cue(
+            &mut inner,
+            sample_cue("cue-2", "Next", "下一句", 2_500, 3_000),
+        );
+        assert!(is_new);
+        assert_eq!(start, 2_500);
+        assert_eq!(inner.cues[0].end_pts_ms, 2_500);
+
+        // 乱序到来一条 start_pts_ms 更早的新句时，起点应单调不倒退至 2_500ms。
+        let (_, mono_start, _, _) = apply_accepted_cue(
+            &mut inner,
+            sample_cue("cue-3", "Monotonic", "保持单调", 2_100, 2_600),
+        );
+        assert_eq!(mono_start, 2_500);
+        inner.main_played_pts_ms = 2_500;
+        assert_eq!(select_cue(&mut inner).unwrap().unwrap().id, "cue-3");
     }
 
     #[test]
-    fn resuming_playback_shifts_paced_prep_windows_onto_the_real_timeline() {
+    fn apply_accepted_cue_reanchors_late_cues_to_never_drop() {
         let mut inner = test_inner();
-        inner.pace_cue_windows = true;
+        // 播放器已走到 20_000ms，新字幕因网络滞后才收到，其原始时间戳只有 5_000ms（落后 15s）。
+        inner.main_played_pts_ms = 20_000;
+        let (is_new, start, end, emitted) = apply_accepted_cue(
+            &mut inner,
+            sample_cue("late-new", "Delayed speech", "这条迟到的字幕不会丢", 5_000, 7_000),
+        );
+        assert!(is_new);
+        assert_eq!(start, 20_000);
+        assert!(end >= 20_000 + MIN_CUE_DISPLAY_MS);
+        assert_eq!(emitted.unwrap().unwrap().id, "late-new");
+
+        // 随着播放推进到 21_500ms，同 ID 增量文本更新时剩余显示不足 2000ms，应自动顺延确保能看清。
+        inner.main_played_pts_ms = 21_500;
+        let (is_new, _, extended_end, _) = apply_accepted_cue(
+            &mut inner,
+            sample_cue(
+                "late-new",
+                "Delayed speech finalized",
+                "这条迟到的字幕不会丢，还会顺延确保阅读时间。",
+                5_000,
+                7_000,
+            ),
+        );
+        assert!(!is_new);
+        assert!(extended_end >= 21_500 + MIN_CUE_DISPLAY_MS);
+    }
+
+    #[test]
+    fn select_cue_matches_one_to_one_without_double_prebuffer_offset() {
+        let mut inner = test_inner();
         inner.main_played_pts_ms = 0;
-        // During preparation the render clock has not started, so the first
-        // translated sentence is slotted at 0..2s.
-        let mut cue = paced_cue("prep-cue", 0, 0);
-        assign_new_cue_window(&mut inner, &mut cue);
-        assert_eq!((cue.start_pts_ms, cue.end_pts_ms), (0, 2_000));
-        inner.cues.push_back(cue);
+        inner.cues.push_back(sample_cue(
+            "cue-at-5s",
+            "Welcome back",
+            "欢迎回来",
+            5_000,
+            7_500,
+        ));
 
-        sync_cue_base(&mut inner, 5_900);
+        // 播放器推进尚未到 5_000ms 时不会提前命中。
+        assert_eq!(select_cue(&mut inner), None);
 
-        let stored = &inner.cues[0];
-        assert_eq!(inner.cue_base_pts_ms, 5_900);
-        assert_eq!((stored.start_pts_ms, stored.end_pts_ms), (5_900, 7_900));
-        assert_eq!(inner.next_display_start_ms, Some(7_900));
+        // 播放进度与探路 5_000ms 1:1 对齐时精准出字。
+        inner.main_played_pts_ms = 5_000;
+        assert_eq!(
+            select_cue(&mut inner).unwrap().unwrap().id,
+            "cue-at-5s"
+        );
+    }
+
+    #[test]
+    fn direct_tap_mode_displays_latest_non_empty_cue_immediately() {
+        let mut inner = test_inner();
+        inner.direct_tap_mode = true;
+        inner.main_played_pts_ms = 1_500;
+
+        // 直采模式下即便采集时间戳略领先播放时钟，仍应立即显示最新非空字幕。
+        inner.cues.push_back(sample_cue(
+            "tap-1",
+            "Breaking news",
+            "突发新闻",
+            2_400,
+            4_400,
+        ));
+        inner.cues.push_back(sample_cue("tap-empty", "", "   ", 2_500, 4_500));
+
+        assert_eq!(select_cue(&mut inner).unwrap().unwrap().id, "tap-1");
+
+        // 超过宽限期（4_400 + 4_000 = 8_400）后清除。
+        inner.main_played_pts_ms = 8_401;
+        assert_eq!(select_cue(&mut inner), Some(None));
     }
 }

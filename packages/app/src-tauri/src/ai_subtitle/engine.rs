@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -25,43 +25,40 @@ use super::models::{
 };
 
 const DEFAULT_BAILIAN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub(crate) const DEFAULT_BAILIAN_REALTIME_MODEL: &str = "qwen3.8-livetranslate-flash-realtime";
 const ASR_MODEL: &str = "paraformer-v2";
-const MIN_SEGMENT_SAMPLES: usize = 40_000;
-const MAX_SEGMENT_SAMPLES: usize = 56_000;
+const OPENAI_ASR_MODEL: &str = "whisper-1";
+const MIN_SEGMENT_SAMPLES: usize = 51_200;
+const MAX_SEGMENT_SAMPLES: usize = 72_000;
 const VAD_RMS_THRESHOLD: f32 = 0.008;
 const MAX_CONTEXT_SENTENCES: usize = 2;
 const REALTIME_CUE_TAIL_MS: u64 = 3_000;
 /// Live captions release one sentence at a time. These limits stop a single cue
 /// from growing into a wall of text when the model never marks the turn as done.
 /// They are loose enough to let the translation finish a natural sentence.
-const REALTIME_CUE_MAX_DURATION_MS: u64 = 4_500;
-const REALTIME_CUE_MAX_TRANSLATED_CHARS: usize = 38;
-const REALTIME_CUE_MAX_SOURCE_CHARS: usize = 130;
+const REALTIME_CUE_MAX_DURATION_MS: u64 = 4_000;
+const REALTIME_CUE_MAX_TRANSLATED_CHARS: usize = 32;
+const REALTIME_CUE_MAX_SOURCE_CHARS: usize = 120;
 /// A sentence terminator only ends a cue once the translation has at least this
 /// many characters, so short interjections do not become their own caption.
 const REALTIME_MIN_SENTENCE_CHARS: usize = 4;
 /// A long sentence may also break at a clause comma once it reaches this size,
 /// which keeps the break on a natural boundary instead of mid-word.
-const REALTIME_CLAUSE_BREAK_CHARS: usize = 18;
+const REALTIME_CLAUSE_BREAK_CHARS: usize = 12;
 /// A hard cap (duration/size) may only force a split once the translation is at
 /// least this long; below it the cue stays partial so the caption is never cut
 /// at 8-9 characters while the translation is still streaming.
-const REALTIME_FORCED_RELEASE_MIN_CHARS: usize = 20;
+const REALTIME_FORCED_RELEASE_MIN_CHARS: usize = 16;
 /// `response.text.done` means the server finished the whole turn, so even a
 /// short polished translation may be released.
 const REALTIME_DONE_RELEASE_MIN_CHARS: usize = 4;
-/// Temporary diagnostics counter for live subtitle troubleshooting.
 static DIAG_LINES: AtomicU64 = AtomicU64::new(0);
-/// Translation text arrives about this long after the audio that produced it.
-/// Compensating keeps the next caption's window aligned with what the viewer hears.
-const REALTIME_TRANSLATION_LAG_MS: u64 = 1_500;
-const REALTIME_SPEECH_END_SILENCE_MS: u32 = 450;
-const MAX_PENDING_REALTIME_SPEECH_STARTS: usize = 16;
-const UNANCHORED_REALTIME_CUE_LOOKBACK_MS: u64 = 1_000;
+/// 实时模型首字回溯补偿设为 2600ms：扣除云端 ASR 从人声开口到返回首字的固有识别滞后，使 0.0s 默认偏移即对齐人声。
+const REALTIME_TRANSLATION_LAG_MS: u64 = 2_600;
 const REALTIME_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REALTIME_SESSION_TIMEOUT: Duration = Duration::from_secs(15);
-const REALTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+const REALTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(500);
 type RealtimeSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -76,7 +73,6 @@ pub struct BailianRealtimeEngine {
     api_key: String,
     cue_sender: UnboundedSender<AiSubtitleCue>,
     latest_audio_pts_ms: Arc<AtomicU64>,
-    speech_tracker: Arc<Mutex<RealtimeSpeechTracker>>,
     session: Option<RealtimeSession>,
 }
 
@@ -85,15 +81,18 @@ impl BailianRealtimeEngine {
         config: AiSubtitleConfig,
         cue_sender: UnboundedSender<AiSubtitleCue>,
     ) -> Result<Self, String> {
-        if config.provider != AiSubtitleProvider::DashScope {
-            return Err("百炼 Realtime 引擎只支持 DashScope".to_string());
+        if !matches!(
+            config.provider,
+            AiSubtitleProvider::DashScope | AiSubtitleProvider::OpenAiCompatible
+        ) {
+            return Err("Realtime 引擎仅支持阿里百炼或通用 OpenAI 兼容服务".to_string());
         }
         let api_key = config
             .api_key
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "请先配置百炼 API Key".to_string())?
+            .ok_or_else(|| "请先配置 API Key".to_string())?
             .to_string();
         let model = if config.model.to_ascii_lowercase().contains("realtime") {
             config.model.trim().to_string()
@@ -107,7 +106,6 @@ impl BailianRealtimeEngine {
             api_key,
             cue_sender,
             latest_audio_pts_ms: Arc::new(AtomicU64::new(0)),
-            speech_tracker: Arc::new(Mutex::new(RealtimeSpeechTracker::default())),
             session: None,
         })
     }
@@ -117,37 +115,22 @@ impl BailianRealtimeEngine {
             return Ok(());
         };
         let RealtimeSession { outgoing, mut task } = session;
-        let finish_result = timeout(
-            REALTIME_SHUTDOWN_TIMEOUT,
-            outgoing.send(Message::Text(
-                json!({ "type": "session.finish" }).to_string().into(),
-            )),
-        )
-        .await;
-        match finish_result {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
+        // 在后台异步发送 session.finish 并限时收尾，避免阻塞切台或因 cue_receiver 已关闭而向上传播错误。
+        tokio::spawn(async move {
+            let _ = timeout(
+                Duration::from_millis(200),
+                outgoing.send(Message::Text(
+                    json!({ "type": "session.finish" }).to_string().into(),
+                )),
+            )
+            .await;
+            if timeout(REALTIME_SHUTDOWN_TIMEOUT, &mut task).await.is_err() {
                 task.abort();
                 let _ = task.await;
-                return Err(format!("发送百炼 Realtime session.finish 失败：{error}"));
             }
-            Err(_) => {
-                task.abort();
-                let _ = task.await;
-                return Err("发送百炼 Realtime session.finish 超时".to_string());
-            }
-        }
-
-        let result = match timeout(REALTIME_SHUTDOWN_TIMEOUT, &mut task).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(error)) => Err(format!("百炼 Realtime 接收任务失败：{error}")),
-            Err(_) => {
-                task.abort();
-                Err("等待百炼 Realtime session.finished 超时".to_string())
-            }
-        };
-        drop(outgoing);
-        result
+            drop(outgoing);
+        });
+        Ok(())
     }
 }
 
@@ -161,8 +144,20 @@ impl AiSubtitleEngine for BailianRealtimeEngine {
             if self.session.is_some() {
                 return Err("百炼 Realtime 引擎已经启动".to_string());
             }
+            let default_base = if self.config.provider == AiSubtitleProvider::OpenAiCompatible {
+                DEFAULT_OPENAI_BASE_URL
+            } else {
+                DEFAULT_BAILIAN_BASE_URL
+            };
+            let base_url = self
+                .config
+                .base_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(default_base);
             let request = build_realtime_request(
-                self.config.base_url.as_deref(),
+                Some(base_url),
                 &self.model,
                 &self.api_key,
             )?;
@@ -181,7 +176,6 @@ impl AiSubtitleEngine for BailianRealtimeEngine {
             let (outgoing, mut outgoing_receiver) = mpsc::channel(16);
             let cue_sender = self.cue_sender.clone();
             let latest_audio_pts_ms = Arc::clone(&self.latest_audio_pts_ms);
-            let speech_tracker = Arc::clone(&self.speech_tracker);
             let task = tokio::spawn(async move {
                 let mut cue_assembler = RealtimeCueAssembler::default();
                 loop {
@@ -217,7 +211,6 @@ impl AiSubtitleEngine for BailianRealtimeEngine {
                                         text.as_ref(),
                                         latest_audio_pts_ms.load(Ordering::SeqCst),
                                         &cue_sender,
-                                        &speech_tracker,
                                     )?;
                                 }
                                 Some(Ok(Message::Ping(payload))) => {
@@ -252,9 +245,6 @@ impl AiSubtitleEngine for BailianRealtimeEngine {
                 chunk.pts_ms.saturating_add(chunk.duration_ms as u64),
                 Ordering::SeqCst,
             );
-            if let Ok(mut tracker) = self.speech_tracker.lock() {
-                tracker.observe(&chunk);
-            }
             let mut pcm_bytes = Vec::with_capacity(chunk.samples.len() * 2);
             for sample in chunk.samples {
                 pcm_bytes.extend_from_slice(&sample.to_le_bytes());
@@ -393,7 +383,6 @@ async fn wait_for_realtime_event(
 #[derive(Default)]
 struct RealtimeCueAssembler {
     cue: Option<AiSubtitleCue>,
-    next_start_pts_ms: Option<u64>,
     source_item_id: Option<String>,
     source_buffer: String,
     source_offset: usize,
@@ -404,45 +393,12 @@ struct RealtimeCueAssembler {
     last_released_start_pts_ms: Option<u64>,
 }
 
-#[derive(Default)]
-struct RealtimeSpeechTracker {
-    in_speech: bool,
-    silence_ms: u32,
-    pending_starts: VecDeque<u64>,
-}
-
-impl RealtimeSpeechTracker {
-    fn observe(&mut self, chunk: &Pcm16kChunk) {
-        if chunk.rms_energy >= VAD_RMS_THRESHOLD {
-            if !self.in_speech {
-                self.pending_starts.push_back(chunk.pts_ms);
-                if self.pending_starts.len() > MAX_PENDING_REALTIME_SPEECH_STARTS {
-                    self.pending_starts.pop_front();
-                }
-            }
-            self.in_speech = true;
-            self.silence_ms = 0;
-        } else if self.in_speech {
-            self.silence_ms = self.silence_ms.saturating_add(chunk.duration_ms);
-            if self.silence_ms >= REALTIME_SPEECH_END_SILENCE_MS {
-                self.in_speech = false;
-                self.silence_ms = 0;
-            }
-        }
-    }
-
-    fn take_start(&mut self) -> Option<u64> {
-        self.pending_starts.pop_front()
-    }
-}
-
 impl RealtimeCueAssembler {
     fn handle_event(
         &mut self,
         payload: &str,
         latest_audio_pts_ms: u64,
         cue_sender: &UnboundedSender<AiSubtitleCue>,
-        speech_tracker: &Mutex<RealtimeSpeechTracker>,
     ) -> Result<(), String> {
         let event: Value = serde_json::from_str(payload)
             .map_err(|error| format!("解析百炼 Realtime 事件失败：{error}"))?;
@@ -457,7 +413,7 @@ impl RealtimeCueAssembler {
                 .unwrap_or("未知服务端错误");
             return Err(format!("百炼 Realtime 返回错误：{message}"));
         }
-        // Temporary diagnostics for live subtitle troubleshooting.
+        // 诊断日志：记录模型事件与当前音频时钟。
         if matches!(
             event_type,
             "response.text.delta"
@@ -485,19 +441,8 @@ impl RealtimeCueAssembler {
                 );
             }
         }
-        if event_type == "input_audio_buffer.speech_started" {
-            let local_start_pts_ms = speech_tracker
-                .lock()
-                .ok()
-                .and_then(|mut tracker| tracker.take_start());
-            self.next_start_pts_ms = event.get("audio_start_ms").and_then(Value::as_u64);
-            self.next_start_pts_ms = local_start_pts_ms.or(self.next_start_pts_ms).or(Some(
-                latest_audio_pts_ms.saturating_sub(UNANCHORED_REALTIME_CUE_LOOKBACK_MS),
-            ));
-            return Ok(());
-        }
         if event_type == "response.done" {
-            // Some deployments only send the finished text on response.done.
+            // 部分部署仅在 response.done 中返回完整译文。
             if !self.translation_received {
                 if let Some(text) = response_output_text(&event) {
                     self.reset_translation_stream();
@@ -507,7 +452,6 @@ impl RealtimeCueAssembler {
                         true,
                         latest_audio_pts_ms,
                         cue_sender,
-                        speech_tracker,
                     )?;
                 }
             }
@@ -531,7 +475,6 @@ impl RealtimeCueAssembler {
                         false,
                         latest_audio_pts_ms,
                         cue_sender,
-                        speech_tracker,
                     )?;
                 }
             }
@@ -543,7 +486,6 @@ impl RealtimeCueAssembler {
                         true,
                         latest_audio_pts_ms,
                         cue_sender,
-                        speech_tracker,
                     )?;
                 }
             }
@@ -555,7 +497,6 @@ impl RealtimeCueAssembler {
                         false,
                         latest_audio_pts_ms,
                         cue_sender,
-                        speech_tracker,
                     )?;
                 }
             }
@@ -567,24 +508,17 @@ impl RealtimeCueAssembler {
                         true,
                         latest_audio_pts_ms,
                         cue_sender,
-                        speech_tracker,
                     )?;
                 }
-                // The server has finished polishing this sentence's translation,
-                // so release it now instead of waiting for a full stop or a
-                // size limit that may never arrive.
                 let translated_enough = self.cue.as_ref().is_some_and(|cue| {
                     cue.translated_text.trim().chars().count() >= REALTIME_DONE_RELEASE_MIN_CHARS
                 });
-                if translated_enough
-                    && self.finish_current_cue(
+                if translated_enough {
+                    let _ = self.finish_current_cue(
                         latest_audio_pts_ms,
                         cue_sender,
                         REALTIME_DONE_RELEASE_MIN_CHARS,
-                    )?
-                {
-                    self.next_start_pts_ms =
-                        Some(self.next_cue_start_after_release(latest_audio_pts_ms));
+                    )?;
                 }
             }
             _ => {}
@@ -599,7 +533,6 @@ impl RealtimeCueAssembler {
         replace: bool,
         latest_audio_pts_ms: u64,
         cue_sender: &UnboundedSender<AiSubtitleCue>,
-        speech_tracker: &Mutex<RealtimeSpeechTracker>,
     ) -> Result<(), String> {
         if let Some(item_id) = item_id {
             if self.source_item_id.as_deref() != Some(item_id) {
@@ -622,7 +555,7 @@ impl RealtimeCueAssembler {
             return Ok(());
         }
         self.source_offset += pending.chars().count();
-        self.append_source_text(&pending, latest_audio_pts_ms, speech_tracker);
+        self.append_source_text(&pending, latest_audio_pts_ms);
         self.enforce_size_limits(latest_audio_pts_ms, cue_sender)?;
         self.emit_partial(cue_sender)
     }
@@ -634,7 +567,6 @@ impl RealtimeCueAssembler {
         replace: bool,
         latest_audio_pts_ms: u64,
         cue_sender: &UnboundedSender<AiSubtitleCue>,
-        speech_tracker: &Mutex<RealtimeSpeechTracker>,
     ) -> Result<(), String> {
         if let Some(response_id) = response_id {
             if self.translation_response_id.as_deref() != Some(response_id) {
@@ -659,22 +591,21 @@ impl RealtimeCueAssembler {
             return Ok(());
         }
         self.translation_offset += pending.chars().count();
-        self.append_translation_text(
-            &pending,
-            latest_audio_pts_ms,
-            cue_sender,
-            speech_tracker,
-        )?;
+        self.append_translation_text(&pending, latest_audio_pts_ms, cue_sender)?;
         self.emit_partial(cue_sender)
     }
 
-    fn append_source_text(
-        &mut self,
-        text: &str,
-        latest_audio_pts_ms: u64,
-        speech_tracker: &Mutex<RealtimeSpeechTracker>,
-    ) {
-        let cue = self.ensure_cue(latest_audio_pts_ms, speech_tracker);
+    fn append_source_text(&mut self, text: &str, latest_audio_pts_ms: u64) {
+        let text = if self.cue.is_none() {
+            let trimmed = text.trim_start_matches(is_leading_trivia_char);
+            if trimmed.is_empty() {
+                return;
+            }
+            trimmed
+        } else {
+            text
+        };
+        let cue = self.ensure_cue(latest_audio_pts_ms);
         cue.source_text.push_str(text);
         cue.end_pts_ms = cue
             .end_pts_ms
@@ -687,29 +618,38 @@ impl RealtimeCueAssembler {
         text: &str,
         latest_audio_pts_ms: u64,
         cue_sender: &UnboundedSender<AiSubtitleCue>,
-        speech_tracker: &Mutex<RealtimeSpeechTracker>,
     ) -> Result<(), String> {
         for character in text.chars() {
+            if self.cue.is_none() && is_leading_trivia_char(character) {
+                continue;
+            }
             {
-                let cue = self.ensure_cue(latest_audio_pts_ms, speech_tracker);
+                let cue = self.ensure_cue(latest_audio_pts_ms);
+                let anchored_pts_ms =
+                    latest_audio_pts_ms.saturating_sub(REALTIME_TRANSLATION_LAG_MS);
+                // 若此前仅收到零星 ASR 噪声并在停顿后超过 1.2s 才产出首个译文汉字，重锚定到扣除首字滞后后的当前说话时刻。
+                if cue.translated_text.is_empty()
+                    && anchored_pts_ms > cue.start_pts_ms.saturating_add(1_200)
+                {
+                    cue.start_pts_ms = anchored_pts_ms;
+                    cue.end_pts_ms = cue
+                        .end_pts_ms
+                        .max(cue.start_pts_ms.saturating_add(REALTIME_CUE_TAIL_MS));
+                }
                 cue.translated_text.push(character);
                 cue.end_pts_ms = cue
                     .end_pts_ms
                     .max(latest_audio_pts_ms.saturating_add(REALTIME_CUE_TAIL_MS))
                     .max(cue.start_pts_ms.saturating_add(1));
             }
-            if self.should_release_translation(character)
-                && self.finish_current_cue(
+            if self.should_release_translation(character) {
+                let _ = self.finish_current_cue(
                     latest_audio_pts_ms,
                     cue_sender,
                     REALTIME_MIN_SENTENCE_CHARS,
-                )?
-            {
-                self.next_start_pts_ms = Some(self.next_cue_start_after_release(latest_audio_pts_ms));
+                )?;
             }
         }
-        // Apply the size/duration caps once per chunk so a long sentence is cut
-        // at the cap instead of running until the model ends the turn.
         self.enforce_size_limits(latest_audio_pts_ms, cue_sender)?;
         Ok(())
     }
@@ -733,53 +673,30 @@ impl RealtimeCueAssembler {
         let should_release = self.cue.as_ref().is_some_and(|cue| {
             let translated_chars = cue.translated_text.trim().chars().count();
             let source_chars = cue.source_text.chars().count();
-            // Never publish a half-translated caption: a forced split only
-            // happens once the translation itself is substantial enough.
             translated_chars >= REALTIME_FORCED_RELEASE_MIN_CHARS
                 && (source_chars >= REALTIME_CUE_MAX_SOURCE_CHARS
                     || translated_chars >= REALTIME_CUE_MAX_TRANSLATED_CHARS
                     || latest_audio_pts_ms.saturating_sub(cue.start_pts_ms)
                         >= REALTIME_CUE_MAX_DURATION_MS)
         });
-        if should_release
-            && self.finish_current_cue(
+        if should_release {
+            let _ = self.finish_current_cue(
                 latest_audio_pts_ms,
                 cue_sender,
                 REALTIME_FORCED_RELEASE_MIN_CHARS,
-            )?
-        {
-            self.next_start_pts_ms = Some(self.next_cue_start_after_release(latest_audio_pts_ms));
+            )?;
         }
         Ok(())
     }
 
-    fn ensure_cue(
-        &mut self,
-        latest_audio_pts_ms: u64,
-        speech_tracker: &Mutex<RealtimeSpeechTracker>,
-    ) -> &mut AiSubtitleCue {
+    fn ensure_cue(&mut self, latest_audio_pts_ms: u64) -> &mut AiSubtitleCue {
         if self.cue.is_none() {
-            let local_start_pts_ms = speech_tracker
-                .lock()
-                .ok()
-                .and_then(|mut tracker| tracker.take_start());
-            let used_lookback = local_start_pts_ms.is_none() && self.next_start_pts_ms.is_none();
-            let start_pts_ms = self
-                .next_start_pts_ms
-                .take()
-                .or(local_start_pts_ms)
-                .unwrap_or_else(|| {
-                    latest_audio_pts_ms.saturating_sub(UNANCHORED_REALTIME_CUE_LOOKBACK_MS)
-                });
-            if used_lookback {
-                log::info!(
-                    "[AiSubtitle][LookbackDiag] runtime latest_audio_pts_ms={} lookback_ms={} cue_start_pts_ms={} applied_offset_ms={}",
-                    latest_audio_pts_ms,
-                    UNANCHORED_REALTIME_CUE_LOOKBACK_MS,
-                    start_pts_ms,
-                    latest_audio_pts_ms.saturating_sub(start_pts_ms),
-                );
-            }
+            // 直接锚定当前收到首字时的探路音频时间轴，并保证单调递增。
+            let raw_start = latest_audio_pts_ms.saturating_sub(REALTIME_TRANSLATION_LAG_MS);
+            let start_pts_ms = match self.last_released_start_pts_ms {
+                Some(last_start) => raw_start.max(last_start.saturating_add(400)),
+                None => raw_start,
+            };
             self.cue = Some(AiSubtitleCue {
                 id: Uuid::new_v4().to_string(),
                 source_text: String::new(),
@@ -807,9 +724,6 @@ impl RealtimeCueAssembler {
             self.cue = None;
             return Ok(false);
         }
-        // A caption without a substantial translation is an English-only
-        // fragment. Keep the cue partial and wait for the translation instead
-        // of publishing it, even when the size or duration limit is reached.
         let translated_chars = cue.translated_text.trim().chars().count();
         if translated_chars < min_chars {
             return Ok(false);
@@ -827,12 +741,6 @@ impl RealtimeCueAssembler {
             .send(cue)
             .map_err(|_| "AI 字幕事件接收端已关闭".to_string())?;
         Ok(true)
-    }
-
-    fn next_cue_start_after_release(&self, latest_audio_pts_ms: u64) -> u64 {
-        let compensated = latest_audio_pts_ms.saturating_sub(REALTIME_TRANSLATION_LAG_MS);
-        self.last_released_start_pts_ms
-            .map_or(compensated, |start| compensated.max(start.saturating_add(1)))
     }
 
     fn emit_partial(&self, cue_sender: &UnboundedSender<AiSubtitleCue>) -> Result<(), String> {
@@ -865,6 +773,14 @@ fn is_sentence_terminator(character: char) -> bool {
 /// once the translation is long enough.
 fn is_clause_separator(character: char) -> bool {
     matches!(character, '，' | '、' | ',')
+}
+
+/// 判断字符是否属于句首残留空白或尾随标点，用于避免在上一句刚结束时抢跑建条。
+fn is_leading_trivia_char(character: char) -> bool {
+    character.is_whitespace()
+        || is_sentence_terminator(character)
+        || is_clause_separator(character)
+        || matches!(character, '.' | '"' | '\'' | '”' | '’' | '）' | ')')
 }
 
 fn response_output_text(event: &Value) -> Option<String> {
@@ -935,12 +851,13 @@ impl BailianTwoStageEngine {
         config: AiSubtitleConfig,
         cue_sender: UnboundedSender<AiSubtitleCue>,
     ) -> Result<Self, String> {
-        if config.provider != AiSubtitleProvider::DashScope
-            || config.route != AiSubtitleRoute::TwoStage
-        {
-            return Err("百炼两步走引擎只支持 DashScope 的 two_stage 路线".to_string());
+        if !matches!(
+            config.provider,
+            AiSubtitleProvider::DashScope | AiSubtitleProvider::OpenAiCompatible
+        ) {
+            return Err("两步走引擎仅支持阿里百炼或通用 OpenAI 兼容服务".to_string());
         }
-        // 支持任意百炼模型，包括 qwen-plus, qwen-turbo, qwen3.8-livetranslate 系列
+        // 支持阿里百炼与通用 OpenAI 兼容翻译模型。
         let model = config.model.trim();
         if model.is_empty() {
             return Err("请先配置翻译模型".to_string());
@@ -950,13 +867,13 @@ impl BailianTwoStageEngine {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "请先配置百炼 API Key".to_string())?
+            .ok_or_else(|| "请先配置 API Key".to_string())?
             .to_string();
 
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|error| format!("创建百炼 HTTP 客户端失败：{error}"))?;
+            .map_err(|error| format!("创建 HTTP 字幕客户端失败：{error}"))?;
 
         Ok(Self {
             client,
@@ -969,13 +886,26 @@ impl BailianTwoStageEngine {
     }
 
     fn base_url(&self) -> &str {
+        let default_url = if self.config.provider == AiSubtitleProvider::OpenAiCompatible {
+            DEFAULT_OPENAI_BASE_URL
+        } else {
+            DEFAULT_BAILIAN_BASE_URL
+        };
         self.config
             .base_url
             .as_deref()
             .map(str::trim)
             .filter(|base_url| !base_url.is_empty())
-            .unwrap_or(DEFAULT_BAILIAN_BASE_URL)
+            .unwrap_or(default_url)
             .trim_end_matches('/')
+    }
+
+    fn asr_model(&self) -> &'static str {
+        if self.config.provider == AiSubtitleProvider::OpenAiCompatible {
+            OPENAI_ASR_MODEL
+        } else {
+            ASR_MODEL
+        }
     }
 
     async fn recognize(&self, wav: Vec<u8>) -> Result<String, String> {
@@ -983,7 +913,7 @@ impl BailianTwoStageEngine {
             .file_name("segment.wav")
             .mime_str("audio/wav")
             .map_err(|error| format!("创建 ASR 音频数据失败：{error}"))?;
-        let form = Form::new().text("model", ASR_MODEL).part("file", file);
+        let form = Form::new().text("model", self.asr_model()).part("file", file);
         let response = self
             .client
             .post(format!("{}/audio/transcriptions", self.base_url()))
@@ -1149,17 +1079,14 @@ pub fn create_ai_subtitle_engine(
     cue_sender: UnboundedSender<AiSubtitleCue>,
 ) -> Result<Box<dyn AiSubtitleEngine>, String> {
     let is_realtime_model = config.model.to_ascii_lowercase().contains("realtime");
-    if config.provider == AiSubtitleProvider::DashScope
-        && (config.route == AiSubtitleRoute::Realtime || is_realtime_model)
+    if is_realtime_model
+        || (config.provider == AiSubtitleProvider::DashScope
+            && config.route == AiSubtitleRoute::Realtime)
     {
         return Ok(Box::new(BailianRealtimeEngine::new(config, cue_sender)?));
     }
 
-    if config.provider == AiSubtitleProvider::DashScope && config.route == AiSubtitleRoute::TwoStage
-    {
-        return Ok(Box::new(BailianTwoStageEngine::new(config, cue_sender)?));
-    }
-    Err("当前 AI 字幕服务商或路线尚未实现".to_string())
+    Ok(Box::new(BailianTwoStageEngine::new(config, cue_sender)?))
 }
 
 fn pcm16_mono_to_wav(samples: &[i16]) -> Result<Vec<u8>, String> {
@@ -1252,10 +1179,13 @@ mod tests {
     use super::{
         build_realtime_request, build_realtime_session_update, create_ai_subtitle_engine,
         extract_completion_text, is_silent, pcm16_mono_to_wav, validate_segment, AiSubtitleEngine,
-        RealtimeCueAssembler, RealtimeSpeechTracker, DEFAULT_BAILIAN_REALTIME_MODEL,
+        RealtimeCueAssembler, DEFAULT_BAILIAN_REALTIME_MODEL, REALTIME_CLAUSE_BREAK_CHARS,
         REALTIME_CUE_MAX_SOURCE_CHARS, REALTIME_CUE_MAX_TRANSLATED_CHARS,
+        REALTIME_TRANSLATION_LAG_MS,
     };
-    use crate::ai_subtitle::models::{AiSubtitleConfig, AiSubtitleRoute, Pcm16kChunk};
+    use crate::ai_subtitle::models::{
+        AiSubtitleConfig, AiSubtitleProvider, AiSubtitleRoute, Pcm16kChunk,
+    };
     use axum::extract::State;
     use axum::routing::post;
     use axum::{Json, Router};
@@ -1284,11 +1214,11 @@ mod tests {
     }
 
     #[test]
-    fn segment_duration_must_be_between_two_point_five_and_three_point_five_seconds() {
-        assert!(validate_segment(&chunk(40_000, 0.01)).is_ok());
-        assert!(validate_segment(&chunk(56_000, 0.01)).is_ok());
-        assert!(validate_segment(&chunk(39_999, 0.01)).is_err());
-        assert!(validate_segment(&chunk(56_001, 0.01)).is_err());
+    fn segment_duration_must_be_between_three_point_two_and_four_point_five_seconds() {
+        assert!(validate_segment(&chunk(51_200, 0.01)).is_ok());
+        assert!(validate_segment(&chunk(72_000, 0.01)).is_ok());
+        assert!(validate_segment(&chunk(51_199, 0.01)).is_err());
+        assert!(validate_segment(&chunk(72_001, 0.01)).is_err());
     }
 
     #[test]
@@ -1367,14 +1297,12 @@ mod tests {
     fn realtime_events_emit_updating_partial_and_final_cues() {
         let (cue_sender, mut cue_receiver) = unbounded_channel();
         let mut assembler = RealtimeCueAssembler::default();
-        let speech_tracker = Mutex::new(RealtimeSpeechTracker::default());
 
         assembler
             .handle_event(
                 r#"{"type":"conversation.item.input_audio_transcription.completed","transcript":"Hello"}"#,
                 4_000,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
         let source_partial = cue_receiver.try_recv().unwrap();
@@ -1386,7 +1314,6 @@ mod tests {
                 r#"{"type":"response.text.delta","delta":"你好世界"}"#,
                 4_200,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
         let translation_partial = cue_receiver.try_recv().unwrap();
@@ -1399,7 +1326,6 @@ mod tests {
                 r#"{"type":"response.done"}"#,
                 4_300,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
         let final_cue = cue_receiver.try_recv().unwrap();
@@ -1410,73 +1336,57 @@ mod tests {
     }
 
     #[test]
-    fn realtime_cue_uses_local_speech_onset_when_server_onset_is_missing() {
+    fn realtime_cue_anchors_to_audio_clock_with_translation_lag() {
         let (cue_sender, mut cue_receiver) = unbounded_channel();
         let mut assembler = RealtimeCueAssembler::default();
-        let speech_tracker = Mutex::new(RealtimeSpeechTracker::default());
-        speech_tracker.lock().unwrap().observe(&Pcm16kChunk {
-            pts_ms: 1_000,
-            duration_ms: 100,
-            samples: vec![],
-            rms_energy: 0.02,
-        });
 
         assembler
             .handle_event(
                 r#"{"type":"response.text.delta","delta":"你好"}"#,
                 4_000,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
 
-        assert_eq!(cue_receiver.try_recv().unwrap().start_pts_ms, 1_000);
+        assert_eq!(REALTIME_TRANSLATION_LAG_MS, 2_600);
+        assert_eq!(cue_receiver.try_recv().unwrap().start_pts_ms, 1_400);
     }
 
     #[test]
-    fn realtime_cue_prefers_the_local_timeline_anchor() {
+    fn realtime_cue_keeps_monotonic_start_across_sentences() {
         let (cue_sender, mut cue_receiver) = unbounded_channel();
         let mut assembler = RealtimeCueAssembler::default();
-        let speech_tracker = Mutex::new(RealtimeSpeechTracker::default());
-        speech_tracker.lock().unwrap().observe(&Pcm16kChunk {
-            pts_ms: 1_000,
-            duration_ms: 100,
-            samples: vec![],
-            rms_energy: 0.02,
-        });
 
         assembler
             .handle_event(
-                r#"{"type":"input_audio_buffer.speech_started","audio_start_ms":700}"#,
-                1_100,
-                &cue_sender,
-                &speech_tracker,
-            )
-            .unwrap();
-        assembler
-            .handle_event(
-                r#"{"type":"response.text.delta","delta":"你好"}"#,
+                r#"{"type":"response.text.delta","delta":"第一句话结束了。"}"#,
                 4_000,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
+        let first = cue_receiver.try_recv().unwrap();
 
-        assert_eq!(cue_receiver.try_recv().unwrap().start_pts_ms, 1_000);
+        assembler
+            .handle_event(
+                r#"{"type":"response.text.delta","delta":"紧接着"}"#,
+                4_100,
+                &cue_sender,
+            )
+            .unwrap();
+        let second = cue_receiver.try_recv().unwrap();
+        assert_eq!(second.start_pts_ms, first.start_pts_ms + 400);
     }
 
     #[test]
     fn realtime_sentence_punctuation_releases_one_cue_per_sentence() {
         let (cue_sender, mut cue_receiver) = unbounded_channel();
         let mut assembler = RealtimeCueAssembler::default();
-        let speech_tracker = Mutex::new(RealtimeSpeechTracker::default());
 
         assembler
             .handle_event(
                 r#"{"type":"response.text.delta","delta":"你好世界，欢迎回来。"}"#,
                 4_000,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
         let first = cue_receiver.try_recv().unwrap();
@@ -1488,7 +1398,6 @@ mod tests {
                 r#"{"type":"response.text.delta","delta":"第二句也完成了。"}"#,
                 5_000,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
         let second = cue_receiver.try_recv().unwrap();
@@ -1502,15 +1411,13 @@ mod tests {
     fn realtime_long_sentence_breaks_at_a_clause_comma() {
         let (cue_sender, mut cue_receiver) = unbounded_channel();
         let mut assembler = RealtimeCueAssembler::default();
-        let speech_tracker = Mutex::new(RealtimeSpeechTracker::default());
-        let text = "这是一个刚好十八个字的完整句子内容，";
+        let text = format!("{}，", "一".repeat(REALTIME_CLAUSE_BREAK_CHARS));
 
         assembler
             .handle_event(
                 &json!({ "type": "response.text.delta", "delta": text }).to_string(),
                 4_000,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
 
@@ -1520,13 +1427,78 @@ mod tests {
     }
 
     #[test]
-    fn realtime_forced_split_waits_for_twenty_translated_characters() {
+    fn realtime_trailing_punctuation_and_pause_do_not_lock_next_cue_start_early() {
         let (cue_sender, mut cue_receiver) = unbounded_channel();
         let mut assembler = RealtimeCueAssembler::default();
-        let speech_tracker = Mutex::new(RealtimeSpeechTracker::default());
 
-        // The source already hits the source-character cap, but only six
-        // Chinese characters exist, so the forced split must stay partial.
+        // 1. 第一句于 4_000ms 完结释放。
+        assembler
+            .handle_event(
+                r#"{"type":"response.text.delta","delta":"第一句结束了。"}"#,
+                4_000,
+                &cue_sender,
+            )
+            .unwrap();
+        let first = cue_receiver.try_recv().unwrap();
+        assert_eq!(first.start_pts_ms, 4_000 - REALTIME_TRANSLATION_LAG_MS);
+        assert!(!first.is_partial);
+
+        // 2. 紧接着收到句尾残留空格与逗号，应被过滤，绝不能在 4_400ms 抢跑新建空字幕。
+        assembler
+            .handle_event(
+                r#"{"type":"conversation.item.input_audio_transcription.delta","delta":". "}"#,
+                4_000,
+                &cue_sender,
+            )
+            .unwrap();
+        assembler
+            .handle_event(
+                r#"{"type":"response.text.delta","delta":"， "}"#,
+                4_000,
+                &cue_sender,
+            )
+            .unwrap();
+        assert!(cue_receiver.try_recv().is_err());
+
+        // 3. 停顿 5.1s 后于 9_100ms 真正开口翻译下一句，起点应锚定在 9_100ms 扣除首字回溯补偿后的时刻而非 4_400ms。
+        assembler
+            .handle_event(
+                r#"{"type":"response.text.delta","delta":"新一句开始了。"}"#,
+                9_100,
+                &cue_sender,
+            )
+            .unwrap();
+        let second = cue_receiver.try_recv().unwrap();
+        assert_eq!(second.start_pts_ms, 9_100 - REALTIME_TRANSLATION_LAG_MS);
+        assert_eq!(second.translated_text, "新一句开始了。");
+
+        // 4. 若早期仅有零星 ASR 杂音在 10_000ms 建条，隔 2s（12_000ms）才产出首字译文，应重锚定到 12_000ms。
+        assembler
+            .handle_event(
+                r#"{"type":"conversation.item.input_audio_transcription.delta","delta":"uh"}"#,
+                10_000,
+                &cue_sender,
+            )
+            .unwrap();
+        let asr_partial = cue_receiver.try_recv().unwrap();
+        assert_eq!(asr_partial.start_pts_ms, 10_000 - REALTIME_TRANSLATION_LAG_MS);
+        assembler
+            .handle_event(
+                r#"{"type":"response.text.delta","delta":"真正开始说话"}"#,
+                12_000,
+                &cue_sender,
+            )
+            .unwrap();
+        let reanchored = cue_receiver.try_recv().unwrap();
+        assert_eq!(reanchored.start_pts_ms, 12_000 - REALTIME_TRANSLATION_LAG_MS);
+    }
+
+    #[test]
+    fn realtime_forced_split_waits_for_twenty_eight_translated_characters() {
+        let (cue_sender, mut cue_receiver) = unbounded_channel();
+        let mut assembler = RealtimeCueAssembler::default();
+
+        // 原文虽达长度上限，但译文只有六个汉字，应维持流式未完结状态继续等待译文。
         let payload = json!({
             "type": "conversation.item.input_audio_transcription.completed",
             "item_id": "item_1",
@@ -1534,14 +1506,13 @@ mod tests {
         })
         .to_string();
         assembler
-            .handle_event(&payload, 10_000, &cue_sender, &speech_tracker)
+            .handle_event(&payload, 10_000, &cue_sender)
             .unwrap();
         assembler
             .handle_event(
                 r#"{"type":"response.text.delta","delta":"只有六个汉字"}"#,
                 10_000,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
 
@@ -1557,12 +1528,11 @@ mod tests {
     fn realtime_long_translation_without_punctuation_is_force_released() {
         let (cue_sender, mut cue_receiver) = unbounded_channel();
         let mut assembler = RealtimeCueAssembler::default();
-        let speech_tracker = Mutex::new(RealtimeSpeechTracker::default());
         let text = "一".repeat(REALTIME_CUE_MAX_TRANSLATED_CHARS);
         let payload = json!({ "type": "response.text.delta", "delta": text }).to_string();
 
         assembler
-            .handle_event(&payload, 4_000, &cue_sender, &speech_tracker)
+            .handle_event(&payload, 4_000, &cue_sender)
             .unwrap();
 
         let cue = cue_receiver.try_recv().unwrap();
@@ -1578,14 +1548,12 @@ mod tests {
     fn realtime_done_text_does_not_repeat_already_released_sentences() {
         let (cue_sender, mut cue_receiver) = unbounded_channel();
         let mut assembler = RealtimeCueAssembler::default();
-        let speech_tracker = Mutex::new(RealtimeSpeechTracker::default());
 
         assembler
             .handle_event(
                 r#"{"type":"response.text.delta","delta":"你好世界，欢迎回来。"}"#,
                 4_000,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
         let first = cue_receiver.try_recv().unwrap();
@@ -1596,7 +1564,6 @@ mod tests {
                 r#"{"type":"response.text.done","text":"你好世界，欢迎回来。第二句也完成了。"}"#,
                 5_000,
                 &cue_sender,
-                &speech_tracker,
             )
             .unwrap();
         let second = cue_receiver.try_recv().unwrap();
@@ -1609,7 +1576,6 @@ mod tests {
     fn realtime_source_items_pair_with_their_released_translations() {
         let (cue_sender, mut cue_receiver) = unbounded_channel();
         let mut assembler = RealtimeCueAssembler::default();
-        let speech_tracker = Mutex::new(RealtimeSpeechTracker::default());
 
         for (payload, latest_audio_pts_ms) in [
             (
@@ -1638,12 +1604,7 @@ mod tests {
             ),
         ] {
             assembler
-                .handle_event(
-                    &payload.to_string(),
-                    latest_audio_pts_ms,
-                    &cue_sender,
-                    &speech_tracker,
-                )
+                .handle_event(&payload.to_string(), latest_audio_pts_ms, &cue_sender)
                 .unwrap();
         }
 
@@ -1661,6 +1622,21 @@ mod tests {
         assert_eq!(second.source_text, "Second sentence.");
         assert_eq!(second.translated_text, "第二句也完成了。");
         assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn open_ai_compatible_provider_selects_two_stage_engine() {
+        let config = AiSubtitleConfig {
+            provider: AiSubtitleProvider::OpenAiCompatible,
+            api_key: Some("test-token".to_string()),
+            model: "gpt-4o-mini".to_string(),
+            route: AiSubtitleRoute::TwoStage,
+            ..AiSubtitleConfig::default()
+        };
+        let (cue_sender, _) = unbounded_channel();
+        let engine = create_ai_subtitle_engine(config, cue_sender).unwrap();
+
+        assert!(!engine.wants_audio_frames());
     }
 
     #[test]
@@ -1843,12 +1819,12 @@ mod tests {
         let mut engine = super::BailianTwoStageEngine::new(config, cue_sender).unwrap();
         engine.start().await.unwrap();
 
-        for pts_ms in [0, 3_000] {
+        for pts_ms in [0, 4_000] {
             engine
                 .on_segment_pcm(Pcm16kChunk {
                     pts_ms,
-                    duration_ms: 3_000,
-                    samples: vec![100; 48_000],
+                    duration_ms: 4_000,
+                    samples: vec![100; 64_000],
                     rms_energy: 0.01,
                 })
                 .await

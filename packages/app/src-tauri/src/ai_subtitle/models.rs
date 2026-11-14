@@ -25,10 +25,10 @@ impl Default for AiSubtitleConfig {
         Self {
             enabled: false,
             provider: AiSubtitleProvider::DashScope,
-            route: AiSubtitleRoute::TwoStage,
+            route: AiSubtitleRoute::Realtime,
             api_key: None,
             base_url: None,
-            model: "qwen-plus".to_string(),
+            model: "qwen3.8-livetranslate-flash-realtime".to_string(),
             source_language: "auto".to_string(),
             target_language: "zh".to_string(),
             audio_source: AiSubtitleAudioSource::AutoScout,
@@ -74,10 +74,12 @@ pub enum AiSubtitleAudioSource {
 pub enum AiSubtitleProvider {
     #[default]
     DashScope,
-    Zhipu,
-    Gemini,
-    DeepSeek,
-    Tvgo,
+    #[serde(
+        alias = "gemini",
+        alias = "zhipu",
+        alias = "deep_seek",
+        alias = "tvgo"
+    )]
     OpenAiCompatible,
 }
 
@@ -140,7 +142,7 @@ mod tests {
     fn config_defaults_when_fields_are_missing() {
         let config: AiSubtitleConfig = serde_json::from_str("{}").unwrap();
 
-        assert_eq!(config.model, "qwen-plus");
+        assert_eq!(config.model, "qwen3.8-livetranslate-flash-realtime");
         assert_eq!(config.lead_seconds, 5);
         assert_eq!(config.target_language, "zh");
     }

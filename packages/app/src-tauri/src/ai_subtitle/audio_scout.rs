@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -16,8 +17,10 @@ const PCM_FRAME_BYTES: usize = 3_200;
 const PCM_FRAME_SAMPLES: usize = 1_600;
 const FRAME_DURATION_MS: u32 = 100;
 const SAMPLE_RATE_HZ: u32 = 16_000;
-const MIN_SEGMENT_MS: u32 = 2_500;
-const MAX_SEGMENT_MS: u32 = 3_500;
+// A slightly longer phrase gives ASR and translation enough context to return
+// readable subtitles instead of a stream of short fragments.
+const MIN_SEGMENT_MS: u32 = 3_200;
+const MAX_SEGMENT_MS: u32 = 4_500;
 const VAD_RMS_THRESHOLD: f32 = 0.008;
 
 pub type SharedSubtitleEngine = Arc<Mutex<Box<dyn AiSubtitleEngine>>>;
@@ -62,6 +65,8 @@ pub fn start_standalone(
     headers: BTreeMap<String, String>,
     engine: SharedSubtitleEngine,
     decoded_audio_ms: Arc<AtomicU64>,
+    player_played_ms: Arc<AtomicU64>,
+    target_lead_ms: u64,
     cancellation: CancellationToken,
 ) -> Result<StandaloneScout, String> {
     if stream_url.trim().is_empty() {
@@ -81,12 +86,15 @@ pub fn start_standalone(
         .arg("-reconnect_streamed")
         .arg("1")
         .arg("-reconnect_delay_max")
-        .arg("5");
+        .arg("5")
+        .arg("-reconnect_on_network_error")
+        .arg("1")
+        .arg("-reconnect_on_http_error")
+        .arg("4xx,5xx");
 
     let hls_url = stream_url.split_once('?').map_or(stream_url.as_str(), |(url, _)| url);
     if hls_url.trim_end_matches('/').ends_with(".m3u8") {
-        // This provider's HLS segment URLs have no file extension. Permit those
-        // playlists and segments explicitly.
+        // 允许无后缀的 HLS 播放列表与分片扩展名，且不强行改写起跑位置以与 mpv 保持一致。
         command
             .arg("-allowed_extensions")
             .arg("ALL")
@@ -112,9 +120,7 @@ pub fn start_standalone(
         command.arg("-user_agent").arg(user_agent);
         log::warn!("[AiAudioScout/FFmpeg] Scout User-Agent: {user_agent}");
     }
-    // mpv is launched with `--http-proxy=$ALL_PROXY`, but FFmpeg only understands
-    // `http_proxy`/`https_proxy`. Without this, the scout connects directly while the
-    // player goes through the proxy, and providers that only serve proxied IPs answer 403.
+    // mpv 启动时会携带 `--http-proxy=$ALL_PROXY`，这里同步透传给 FFmpeg 以保证出口 IP 一致。
     if let Some(proxy) = proxy_for_ffmpeg() {
         command.arg("-http_proxy").arg(&proxy);
         log::warn!("[AiAudioScout/FFmpeg] Scout proxy: {proxy}");
@@ -123,7 +129,14 @@ pub fn start_standalone(
         command.arg("-headers").arg(header_lines.concat());
     }
 
+    // 探测窗口设成 1MB / 1s，保证包含高清 MPEG-TS 的 AAC 音频流头并加快首包产出；
+    // 禁止传入 `-fflags +nobuffer`，否则 avformat_find_stream_info 会直接丢弃探测期内的音频包，导致 FFmpeg 的 0ms 相对 mpv 超前 1.5s~6s+。
+    // 不传 -re，改由 Rust 端按播放进度与目标蓄水深度动态节流追赶，彻底消除 HLS 切分片阻塞导致的 FFmpeg 时钟累计滞后。
     command
+        .arg("-probesize")
+        .arg("1048576")
+        .arg("-analyzeduration")
+        .arg("1000000")
         .arg("-i")
         .arg(stream_url)
         .arg("-vn")
@@ -133,6 +146,8 @@ pub fn start_standalone(
         .arg("1")
         .arg("-ar")
         .arg(SAMPLE_RATE_HZ.to_string())
+        .arg("-af")
+        .arg("aresample=async=1:first_pts=0")
         .arg("-f")
         .arg("s16le")
         .arg("-acodec")
@@ -187,6 +202,8 @@ pub fn start_standalone(
         stdout,
         engine,
         decoded_audio_ms,
+        player_played_ms,
+        target_lead_ms,
         cancellation,
         first_frame_sender,
         stderr_error,
@@ -294,6 +311,8 @@ async fn run_standalone_process(
     mut stdout: tokio::process::ChildStdout,
     engine: SharedSubtitleEngine,
     decoded_audio_ms: Arc<AtomicU64>,
+    player_played_ms: Arc<AtomicU64>,
+    target_lead_ms: u64,
     cancellation: CancellationToken,
     first_frame_sender: oneshot::Sender<Result<(), String>>,
     stderr_error: Arc<std::sync::Mutex<Option<String>>>,
@@ -341,6 +360,24 @@ async fn run_standalone_process(
                     }
                     if let Err(error) = pipeline.push_frame(frame, &mut assembler).await {
                         break 'read Err(error);
+                    }
+                    // 按当前播放进度与目标蓄水深度动态节流：
+                    // 蓄水期或分片卡顿恢复期按 2.0x 快进追平，稳定期维持 1.0x，超前过多时降速保压。
+                    let decoded_ms = decoded_audio_ms.load(Ordering::SeqCst);
+                    let desired_ms = player_played_ms
+                        .load(Ordering::SeqCst)
+                        .saturating_add(target_lead_ms)
+                        .saturating_add(1_500);
+                    let pace_delay = if decoded_ms < desired_ms {
+                        Duration::from_millis(50)
+                    } else if decoded_ms <= desired_ms.saturating_add(2_500) {
+                        Duration::from_millis(100)
+                    } else {
+                        Duration::from_millis(150)
+                    };
+                    tokio::select! {
+                        _ = cancellation.cancelled() => break 'read Ok(()),
+                        _ = tokio::time::sleep(pace_delay) => {}
                     }
                 }
             }
@@ -567,18 +604,18 @@ mod tests {
     }
 
     #[test]
-    fn segment_assembler_cuts_after_minimum_duration_at_silence() {
+    fn segment_assembler_cuts_after_longer_phrase_at_silence() {
         let pts = AtomicU64::new(0);
         let mut assembler = SegmentAssembler::default();
         let mut completed = None;
-        for _ in 0..25 {
+        for _ in 0..32 {
             let frame = make_frame(vec![0; 1_600], &pts);
             completed = assembler.push(frame);
         }
 
         let segment = completed.unwrap();
-        assert_eq!(segment.duration_ms, 2_500);
-        assert_eq!(segment.samples.len(), 40_000);
+        assert_eq!(segment.duration_ms, 3_200);
+        assert_eq!(segment.samples.len(), 51_200);
         assert_eq!(rms_energy(&segment.samples), 0.0);
     }
 }
