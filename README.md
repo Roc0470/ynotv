@@ -25,6 +25,16 @@
   - **毫秒级双向微调**：支持在 `-15000ms` 至 `+15000ms` 范围内实时调节字幕偏移，并支持流式打字机增量上屏、双语/仅译文切换与字体大小调节。
 - **透明毛玻璃悬浮层**：基于 Tauri 透明窗口叠加层直接渲染在视频画面上方，支持全屏、小窗及画中画自适应。
 
+| AI 实时双语同传效果 | AI 同传设置面板 |
+| :-------------------------------------: | :--------------------------------------: |
+| ![AI 实时双语同传](./docs/images/ai-subtitle-live.jpg) | ![AI 同传设置](./docs/images/ai-subtitle-settings.jpg) |
+
+### 已知问题与欢迎 PR（Known Issues & Contributing）
+
+- **超前探路模式（`auto_scout`）偶发无法播放**：目前部分直播源在开启超前探路时可能出现拉流阻塞或画面无法正常恢复播放的情况。
+  - **临时绕过方式**：在 **AI 同传设置** 中将音频采集来源切换为 **进程环回直采（`direct_tap`）**。
+  - **欢迎协助定位与提交 PR**：核心调度与探路逻辑位于 [`audio_scout.rs`](./packages/app/src-tauri/src/ai_subtitle/audio_scout.rs)、[`controller.rs`](./packages/app/src-tauri/src/ai_subtitle/controller.rs) 与 [`lib.rs`](./packages/app/src-tauri/src/lib.rs)，欢迎在 Issues 中反馈复现日志或直接提交 Pull Request。
+
 ---
 
 ## 界面预览
