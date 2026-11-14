@@ -5,303 +5,249 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0-3178C6?logo=typescript)](https://www.typescriptlang.org)
 [![License](https://img.shields.io/badge/License-AGPL%20v3-green.svg)](./LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-blue)](./README.md)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/tbeezy/ynotv/total)
-[![Chat Server](https://img.shields.io/badge/chat-discord-7289da.svg)](https://discord.gg/e5eGa5QETB)
 
-A feature-rich, open source IPTV player for Windows built on [Tauri v2](https://tauri.app) and [mpv](https://mpv.io). 
-
-[Documentation](https://tbeezy.github.io/ynotvdoc)
-
-[![Watch the video](https://i.ibb.co/207znsrw/ynotv-go-Ckngt-Ezr.png)](https://i.ibb.co/207znsrw/ynotv-go-Ckngt-Ezr.png)
-
-[Old Video Demonstration](https://streamable.com/jxjq9n)
+基于 [Tauri v2](https://tauri.app)、[React 19](https://react.dev) 与 [mpv](https://mpv.io) 构建的 Windows 开源桌面端 IPTV 播放器。本仓库在原版 [tbeezy/ynotv](https://github.com/tbeezy/ynotv) 基础上，深度新增了 **AI 实时延时同传字幕** 管线，支持外语直播流的超前音频采音、实时流式翻译与毫秒级双时钟字幕同步。
 
 ---
 
-## Screenshots:
+## 新增特性：AI 实时延时同传字幕
 
-| EPG with preview | VOD |
+面向外语直播频道与无字幕直播流场景，内置完整的本地音频采音、AI 同传与透明悬浮字幕系统：
+
+- **双模式音频采集与自动回退**
+  - **超前探路模式（`auto_scout` / 默认优先）**：复用内置 FFmpeg Sidecar 在后台以纯音频方式超前拉取当前直播流（16kHz 单声道 PCM），默认超前蓄水 **5 秒**（支持 2–20 秒可调），实现画面与译文字幕的高精度同步。
+  - **进程环回直采回退（`direct_tap`）**：当直播源存在单连接限制（Max Connections = 1）或探路器超时/失败时，自动切换至 Windows WASAPI 进程级环回直采，零额外网络连接、防踢线封号。
+- **多模型与多路线同传引擎**
+  - **阿里百炼 DashScope**：支持 `realtime` WebSocket 实时流式同传（默认模型 `qwen3.8-livetranslate-flash-realtime`，内置会话定时无缝刷新防断流）、`two_stage` 两步走（语音识别 + 文本翻译）以及 `multimodal` 多模态路线。
+  - **OpenAI 兼容接口**：支持自定义 `baseUrl`、`apiKey` 与模型（兼容智谱 GLM、Gemini 等服务）。
+- **双时钟对齐与实时控制**
+  - **卡顿冻结保护**：播放器进入缓冲或手动暂停时自动冻结字幕推进时钟，防止字幕抢跑。
+  - **毫秒级双向微调**：支持在 `-15000ms` 至 `+15000ms` 范围内实时调节字幕偏移，并支持流式打字机增量上屏、双语/仅译文切换与字体大小调节。
+- **透明毛玻璃悬浮层**：基于 Tauri 透明窗口叠加层直接渲染在视频画面上方，支持全屏、小窗及画中画自适应。
+
+---
+
+## 界面预览
+
+| EPG 与实时预览 | VOD 点播库 |
 | :-------------------------------------: | :--------------------------------------: |
 | ![EPG with preview](https://i.ibb.co/207znsrw/ynotv-go-Ckngt-Ezr.png) | ![VOD](https://i.ibb.co/FbsQg842/e-R2b3jb.jpg) |
-| Playlist Editor | EPG Editor |
+| 播放列表编辑器 | EPG 编辑器 |
 | ![Playlist Editor](https://i.ibb.co/pjh43VPL/o-Mc7ec-E.png) | ![EPG Editor](https://i.ibb.co/m3jbML0/SPsv-GGe.png) |
-| Watchlist Option with autoswitch | Strem View |
+| 关注列表与自动切台 | Stremio 视图 |
 | ![Watchlist Option with autoswitch](https://i.ibb.co/LXKnnMc6/7Pz-ZPz0.png) | ![Strem View](https://i.ibb.co/0RX8SFMP/2wo-HM6m.jpg) |
-| Sports View | Themes |
+| 体育赛事视图 | 主题系统 |
 | ![Sports View](https://i.ibb.co/NdgQKsbW/Hr6wti-Y.png) | ![Themes](https://i.ibb.co/3bd2L7F/WDj-MMSh.png) |
-| Multiview Menu | PiP View |
+| 多视图菜单 | 画中画视图 |
 | ![Multiview Menu](https://i.imgur.com/KOXyWBs.jpeg) | ![PiP View](https://i.imgur.com/LxweTiN.jpeg) |
-| Multiview 2x2 | DVR Page |
+| 2x2 四分屏 | DVR 录制管理 |
 | ![Multiview 2x2](https://i.imgur.com/V2v5DCy.jpeg) | ![DVR Page](https://i.imgur.com/Pwojil9.png) |
 
-
 ---
-## Features
 
-- **M3U, Xtream Codes & Stalker Support** - multiple EPG sources supported
-- **Stremio Integration & Addons support** - Integrated optional stremio login to sync watchlist/addons or add addons directly
-- **Nuvio Integration** - Integrated login for 2 way sync with watchlist, addons, plugins, collections, settings
-- **Jellyfin Integration (Beta)** - Connect your personal Jellyfin server to browse and stream your libraries
-- **Playlist Editor** - Create Custom playlist from your sources, move categories/channels from one into another
-- **Grid-style EPG** - with an integrated preview window
-- **Catchup & Cache Time Shift** - instant replays on supported channels
-- **Automatic Stream Fallback** - detects and switches away from stalled or dead streams
-- **Smart Auto-Group for Failover** - Auto-cluster duplicate channels into failover groups, with Always Play Primary
-- **Controllers & Phone Remote** - Full gamepad support with spatial navigation, remappable buttons, and chord combos. Use your phone as a remote with QR pairing (guide browser, sports, and multiview tabs)
-- **Channel Stream Probe & IPTV Checker** - Bulk stream health checks (alive/dead/geoblocked/DRM), auto-fill resolution/FPS/bitrate badges, one-click disable of dead channels, and sort groups by quality
-- **Local Library** - Add local movie/series folders auto-matched with TMDB metadata, with watch progress and backup inclusion
-- **Sports Team Channel Linking** - Link teams to channels for one-tap game watching, with auto-linking and backup streams with auto-swap
-- **Simkl, Discord & OpenSubtitles Integration** - Scrobble to Simkl, show what you're watching on Discord, and download subtitles from OpenSubtitles
-- **24 UI Languages** - Full localization support
-- **Transparent EPG Guide, Category Folders & Logo Editor** - Translucent overlay guide, folder grouping of categories, and bulk logo customization
-- **Sports Tab** - real-time scores and detailed game stats with instant search to find channel
-- **Cast to TV** - Cast to any supported TV devices on your local network
-- **Export Playlist to M3U** - Export any modifications you've done into an .m3u
-- **Trakt integration** - Scrobble directly to your Trakt account
-- **Widget System** - Display live sports score in overlay
-- **VOD Support** - rich metadata via TMDB and RPDB with saved progress
-- **Subtitle Integration** - Subsource support for VODs
-- **Popout Player & External player** - play streams in a seperate MPV window or your choice in an external player
-- **Backup DNS/URLs** - automatically swaps when the current source fails
-- **Favorites & Custom Groups** - pull from any source
-- **Channel Management** - rename, hide, and sort categories and channels freely
-- **EPG Editor** - change tvg-id, logos, or auto-match to a different entry
-- **Embedded MPV Playback** - with support for custom parameters
-- **Multiview** - resizable PiP, also supporting up to four simultaneous streams in a 2x2 grid
-- **Channel & EPG Search** - instant results with advanced filtering options
-- **Watchlist & Reminders** - auto-swaps to a channel when a program goes live
-- **Built-in DVR** - record any stream or schedule for later
-- **TV Calendar** - powered by TVMaze for auto-setting reminders on upcoming shows
-- **Reprogrammable Hotkeys** - Fast navigation with ease of access
-- **40+ Built-in Themes** - something for every preference
+## 核心功能
+
+- **多协议直播源与 EPG**：完整支持 M3U、Xtream Codes 与 Stalker 协议，支持多 EPG 节目单源。
+- **生态服务集成**：支持 Stremio、Nuvio（双向同步）与 Jellyfin 媒体库接入，支持 Trakt 与 Simkl 观影记录同步、Discord 状态展示及 OpenSubtitles / SubSource 字幕下载。
+- **网格 EPG 与实时预览**：内置透明浮层 EPG 节目单、预览窗口、分类文件夹、频道分组与 Logo 批量编辑。
+- **回看、时移与自动容灾**：支持频道回看与缓存时移；支持死链/卡顿自动切换备用源、智能同名频道容灾聚类及备用 DNS/URL 自动切换。
+- **多视图与画中画**：支持独立可调大小画中画（PiP）、最多 4 路同时播放的 2×2 网格视图，以及弹窗/外部播放器模式。
+- **内置 DVR 与节目提醒**：支持手动或定时录制直播流；结合 TVMaze 节目日历自动设置开播提醒并自动切台。
+- **本地媒体库与点播元数据**：支持扫描本地影视文件夹并自动匹配 TMDB 元数据与 RPDB 海报评分角标，保存观看进度。
+- **体育赛事与局域网联动**：内置实时体育比分面板与球队频道绑定；支持投屏至局域网电视设备、手机扫码遥控及手柄空间导航。
+- **高可定制性**：提供 40+ 内置主题、24 种界面语言及全自定义快捷键，支持流健康批量检测与导出修改后的 M3U 播放列表。
 
 ---
 
 <details>
-<summary>Building from Source</summary>
+<summary>从源码构建（Building from Source）</summary>
 
-## Building from Source
+## 从源码构建
 
-### Prerequisites
+### 环境要求
 
-- **Node.js** 20.x or higher
-- **pnpm** 9.x or higher — install with `npm install -g pnpm` (the project specifies `9.1.0` via the `packageManager` field; if you have [corepack](https://nodejs.org/api/corepack.html) enabled, the correct version is used automatically)
-- **Rust** (latest stable) — required for the Tauri backend. Install via [rustup](https://rustup.rs/)
+- **Node.js** 20.x 或更高版本
+- **pnpm** 9.x（项目在 `package.json` 中指定 `pnpm@9.1.0`，可使用 `npm install -g pnpm` 安装或通过 `corepack` 启用）
+- **Rust**（最新稳定版，可通过 [rustup](https://rustup.rs/) 安装）
 - **Git**
 
-**Windows additional requirements:**
-- [Microsoft Edge WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/) — required for Tauri's rendering engine
-- Visual Studio 2022 with C++ build tools
+**Windows 额外依赖：**
+- [Microsoft Edge WebView2](https://developer.microsoft.com/en-us/microsoft-edge/webview2/)
+- Visual Studio 2022（含 C++ 生成工具）
 - Windows 10 SDK
 
-### Instructions
+### 构建步骤
 
-**1. Clone the repository**
+**1. 克隆仓库**
 
 ```bash
-git clone https://github.com/tbeezy/ynotv.git
+git clone https://github.com/Roc0470/ynotv.git
 cd ynotv
 ```
 
-**2. Install dependencies**
+**2. 安装依赖**
 
 ```bash
 pnpm install
 ```
 
-**3. Download mpv sidecar**
+**3. 准备运行库与 Sidecar（mpv / ffmpeg / yt-dlp / libmpv）**
 
-FFmpeg is downloaded automatically during the build step, but mpv (and yt-dlp) must be downloaded manually first:
+`packages/app/src-tauri/bin/` 下需要包含 `mpv-x86_64-pc-windows-msvc.exe`、`ffmpeg-x86_64-pc-windows-msvc.exe` 与 `yt-dlp-x86_64-pc-windows-msvc.exe`，`packages/app/src-tauri/` 下需要 `libmpv-2.dll`、`vulkan-1.dll` 及 `VulkanRT-License.txt`：
 
 ```bash
 bash scripts/download-mpv-tauri.sh
+pnpm setup:libmpv
 ```
 
-*(Optional)* If you also want to pre-download FFmpeg manually:
+**4. 启动开发模式**
+
+> 注意：请使用 `@ynotv/app` 的 Tauri 开发命令启动，避免直接在根目录并发拉起多个前端 dev 服务造成 `5173` 端口冲突。
+
 ```bash
-cd packages/app
-node scripts/download-ffmpeg.js
-cd ../..
+pnpm --filter @ynotv/app tauri dev
 ```
 
-**4. Run in development mode**
+**5. 常用静态检查与生产构建**
 
 ```bash
-pnpm dev
-```
+# 前端类型与样式检查
+pnpm typecheck
 
-This starts both the Vite UI dev server and the Tauri app concurrently.
+# Rust 后端快速检查
+cd packages/app/src-tauri && cargo check
 
-**5. Build for production**
-
-```bash
+# 生产安装包构建
 pnpm tauri build
 ```
 
-Build output is located at:
+构建产物输出位于：
 
-```
+```text
 packages/app/src-tauri/target/release/bundle/
 ```
 
-> **Recovery builds**: if a user's database is too large and the app fails to
-> start, there is a one-off database recovery screen (export → rebuild →
-> import) that ships disabled by default. See [docs/recovery-build.md](docs/recovery-build.md)
-> for how to enable it.
+> **数据库恢复构建**：如遇本地数据库过大导致启动异常，可启用单次数据库恢复界面（导出 → 重建 → 导入），详见 [docs/recovery-build.md](docs/recovery-build.md)。
 
 </details>
 
 ---
 
 <details>
-<summary>Data & File Locations</summary>
+<summary>数据与文件目录（Data & File Locations）</summary>
 
-## Data & File Locations
+## 数据与文件目录
 
-### Configuration
+### 配置文件
 
-```
+```text
 %APPDATA%\com.ynotv.app\
-├── settings.json          # Sources, shortcuts, and preferences
-└── .windows-state.json    # Window size and position
+├── settings.json            # 直播源、快捷键与常规偏好设置
+├── ynotv_ai_subtitle.json   # AI 实时字幕服务商、模型与同步偏移配置
+└── .windows-state.json      # 窗口尺寸与位置状态
 ```
 
-### Database (SQLite)
+### 数据库（SQLite）
 
-```
+```text
 %LOCALAPPDATA%\com.ynotv.app\app.db
 ```
 
-The database stores channels, categories, EPG programs (7-day window), VOD movies and series, watchlist entries, reminders, DVR schedules and recordings, channel metadata, and source sync timestamps.
+用于存储频道、分类、7 天 EPG 节目单、VOD 点播数据、关注列表、开播提醒、DVR 录制计划与源同步时间戳。
 
-### Logs
+### 日志与录制目录
 
-Debug logging can be enabled in Settings > Debug. Log output is written to:
-
-```
-%APPDATA%\com.ynotv.app\logs\app.log
-```
-
-### DVR Recordings
-
-The recording directory is configurable in Settings > DVR. The default location is:
-
-```
-%USERPROFILE%\Videos\ynoTV Recordings\
-```
+- 调试日志（在设置 > Debug 中开启）：`%APPDATA%\com.ynotv.app\logs\app.log`
+- DVR 默认录制目录（可在设置中修改）：`%USERPROFILE%\Videos\ynoTV Recordings\`
 
 </details>
 
 ---
 
 <details>
-<summary>Keyboard Shortcuts</summary>
+<summary>默认快捷键（Keyboard Shortcuts）</summary>
 
-## Keyboard Shortcuts
+## 默认快捷键
 
-All shortcuts are fully customizable in Settings > Shortcuts.
+所有快捷键均可在 **Settings > Shortcuts** 中自定义修改。
 
-### Playback
+### 播放控制
 
-| Action | Default |
+| 操作 | 默认快捷键 |
 |---|---|
-| Play / Pause | `Space` |
-| Seek Forward | `Right Arrow` |
-| Seek Backward | `Left Arrow` |
-| Mute / Unmute | `M` |
-| Select Subtitle (Modal) | `J` |
-| Select Audio Track (Modal) | `A` |
-| Toggle Fullscreen | `F` |
-| Replay Last Stream | `Q` |
+| 播放 / 暂停 | `Space` |
+| 快进 | `Right Arrow` |
+| 快退 | `Left Arrow` |
+| 静音 / 取消静音 | `M` |
+| 选择字幕（弹窗） | `J` |
+| 选择音轨（弹窗） | `A` |
+| 切换全屏 | `F` |
+| 重播上一流 | `Q` |
 
-### Navigation
+### 频道导航
 
-| Action | Default |
+| 操作 | 默认快捷键 |
 |---|---|
-| Channel Up | `Up Arrow` |
-| Channel Down | `Down Arrow` |
+| 上一个频道 | `Up Arrow` |
+| 下一个频道 | `Down Arrow` |
 
-### Interface
+### 界面切换
 
-| Action | Default |
+| 操作 | 默认快捷键 |
 |---|---|
-| Toggle Live TV (Guide + Categories) | `L` |
-| Toggle Guide | `G` |
-| Toggle Categories | `C` |
-| Toggle DVR | `R` |
-| Toggle Sports | `U` |
-| Toggle TV Calendar | `T` |
-| Toggle Settings | `,` |
-| Toggle Jellyfin | `K` |
-| Show / Hide Stats | `I` |
-| Focus Search | `S` |
-| Toggle EPG View Layout | `E` |
-| Close / Back | `Esc` |
+| 开关直播面板（节目单 + 分类） | `L` |
+| 开关节目单（Guide） | `G` |
+| 开关分类列表 | `C` |
+| 开关 DVR | `R` |
+| 开关体育赛事 | `U` |
+| 开关剧集日历 | `T` |
+| 打开设置 | `,` |
+| 开关 Jellyfin | `K` |
+| 显示 / 隐藏统计信息 | `I` |
+| 聚焦搜索 | `S` |
+| 切换 EPG 视图布局 | `E` |
+| 关闭 / 返回 | `Esc` |
 
-### Layout
+### 画面布局
 
-| Action | Default |
+| 操作 | 默认快捷键 |
 |---|---|
-| Layout: Main View | `1` |
-| Layout: Picture in Picture | `2` |
-| Layout: Big + Bottom Bar | `3` |
-| Layout: 2×2 Grid | `4` |
+| 布局：主视图 | `1` |
+| 布局：画中画 | `2` |
+| 布局：大图 + 底栏 | `3` |
+| 布局：2×2 四分屏 | `4` |
 
 </details>
 
 ---
 
-## Star History
+## 免责声明
 
-<a href="https://www.star-history.com/?repos=tbeezy%2Fynotv&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=tbeezy/ynotv&type=date&theme=dark&legend=top-left&sealed_token=siqZZiJV0IOChgy89MenOrL0CGYjtWbao3DnPfPuenhCb0wM4gc_7KCWwKl3vcO8WSWDlaob3kPhT44fsP8bXaZKDpDW2jg_-ybrSpv6YutO2Gi-dDCXlrrORZ1uUBUcNMczU6GRBYCt4aifgdJhY2OKPeXJ8Ix3inzPj2rPZc04lUQyZE9amauRWsPx" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=tbeezy/ynotv&type=date&legend=top-left&sealed_token=siqZZiJV0IOChgy89MenOrL0CGYjtWbao3DnPfPuenhCb0wM4gc_7KCWwKl3vcO8WSWDlaob3kPhT44fsP8bXaZKDpDW2jg_-ybrSpv6YutO2Gi-dDCXlrrORZ1uUBUcNMczU6GRBYCt4aifgdJhY2OKPeXJ8Ix3inzPj2rPZc04lUQyZE9amauRWsPx" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=tbeezy/ynotv&type=date&legend=top-left&sealed_token=siqZZiJV0IOChgy89MenOrL0CGYjtWbao3DnPfPuenhCb0wM4gc_7KCWwKl3vcO8WSWDlaob3kPhT44fsP8bXaZKDpDW2jg_-ybrSpv6YutO2Gi-dDCXlrrORZ1uUBUcNMczU6GRBYCt4aifgdJhY2OKPeXJ8Ix3inzPj2rPZc04lUQyZE9amauRWsPx" />
- </picture>
-</a>
+ynoTV 仅作为媒体播放器工具使用，不提供、托管、分发或协助访问任何流媒体服务、广播内容、频道列表或 IPTV 订阅。
+
+应用中访问的所有内容、流地址与播放列表均由终端用户自行获取、配置与管理。开发者不对通过本软件访问的任何第三方内容承担责任。用户应自行确保其访问的内容符合所在司法管辖区的法律法规。
+
+应用内展示的影视与节目元数据来自 TVMaze、TMDB 等公开第三方数据库，ynoTV 不对上述元数据主张所有权。
 
 ---
 
-## Disclaimer
+## 致谢
 
-Built with the help of AI.
+本项目基于并感谢以下开源项目与服务：
 
-ynoTV is a media player only. It does not provide, host, distribute, or facilitate access to any streaming services, broadcast content, channel lists, or IPTV subscriptions of any kind.
-
-All content, streams, and playlists are sourced, configured, and managed solely by the end user. The developers have no knowledge of, control over, or responsibility for any third-party content accessed through the application.
-
-Users are solely responsible for ensuring that any content they access complies with the laws and regulations applicable in their jurisdiction. The developers do not condone or support the use of this application to access unlicensed or unauthorized content.
-
-Metadata displayed within the application is sourced from publicly available third-party databases including TVMaze and TMDB. ynoTV does not claim ownership of this metadata.
-
----
-
-## Credits
-
-ynoTV builds on the following open source projects and services:
-
-
-- [sbtlTV](https://github.com/thesubtleties/sbtlTV) — original foundation
-- [Tauri](https://tauri.app) — desktop application framework
-- [mpv](https://mpv.io) — video playback engine
-- [FFmpeg](https://ffmpeg.org) — recording and thumbnail generation
-- [TVMaze](https://www.tvmaze.com) — TV schedule and show metadata
-- [TMDB](https://www.themoviedb.org) — movie and series metadata
-- [Trakt.tv](https://app.trakt.tv/) - Scrobble support & catalogs
-- [Stremio](https://www.stremio.com/) — for building an open addon ecosystem that makes third-party integration possible
-- [Nuvio](https://nuvio.tv/) — for creating a fantastic open source media platform and making their codebase publicly available
-- [Jellyfin](https://jellyfin.org/) — for their incredible open source media system and personal streaming platform
-- [Harbor](https://github.com/harborstremio/harbor) — Stremio integration and various features
-- [Simkl](https://simkl.com) — scrobbling support for movies and series
-- [OpenSubtitles](https://www.opensubtitles.com) — subtitle downloads in the player
-- [SubSource](https://www.subsource.net) — subtitle search for movies and series
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — YouTube trailer playback
-- [RatingPosterDB](https://ratingposterdb.com) — rating badges on VOD posters
-
+- [tbeezy/ynotv](https://github.com/tbeezy/ynotv) — 上游原版项目
+- [sbtlTV](https://github.com/thesubtleties/sbtlTV) — 早期架构基础
+- [Tauri](https://tauri.app) — 桌面应用框架
+- [mpv](https://mpv.io) — 视频播放引擎
+- [FFmpeg](https://ffmpeg.org) — 录制、缩略图生成与 AI 音频探路
+- [TVMaze](https://www.tvmaze.com) / [TMDB](https://www.themoviedb.org) / [RatingPosterDB](https://ratingposterdb.com) — 节目与影视元数据
+- [Trakt.tv](https://app.trakt.tv/) / [Simkl](https://simkl.com) — 观影进度同步
+- [Stremio](https://www.stremio.com/) / [Nuvio](https://nuvio.tv/) / [Jellyfin](https://jellyfin.org/) / [Harbor](https://github.com/harborstremio/harbor) — 扩展生态与媒体库集成
+- [OpenSubtitles](https://www.opensubtitles.com) / [SubSource](https://www.subsource.net) — 字幕检索与下载
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) — 预告片解析播放
 
 ---
 
-## License
+## 开源协议
 
 [GNU Affero General Public License v3.0](./LICENSE)

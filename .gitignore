@@ -9,6 +9,7 @@ out/
 
 # IDE
 .idea/
+.vscode/
 *.swp
 *.swo
 
@@ -44,6 +45,8 @@ coverage/
 .tldrignore
 .claude/
 documents/
+.tauri-build-local.json
+.tmp-scout-url.txt
 
 # Development notes
 thoughts/
